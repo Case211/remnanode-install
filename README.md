@@ -37,17 +37,17 @@
 ### 1. Скачайте скрипт
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-repo/remnanode-install.sh -o remnanode-install.sh
+curl -fsSL https://raw.githubusercontent.com/Case211/remnanode-install.sh -o remnanode-install.sh
 ```
 
 Или клонируйте репозиторий:
 
 ```bash
-git clone https://github.com/your-repo/remnawave-installer.git
+git clone https://github.com/Case211/remnanode-install.git
 ```
 
 ```bash
-cd remnawave-installer
+cd remnanode-install
 ```
 
 ### 2. Запустите скрипт
