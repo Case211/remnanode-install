@@ -41,7 +41,7 @@
 ### 1. Скачайте скрипт
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Case211/remnanode-install.sh -o remnanode-install.sh
+curl -fsSL https://raw.githubusercontent.com/Case211/remnanode-install/refs/heads/main/remnanode-install.sh -o remnanode-install.sh
 ```
 
 Или клонируйте репозиторий:
