@@ -1,4 +1,4 @@
-# 🚀 Упрощенный скрипт установки Remnawave Node + Caddy Selfsteal + Netbird + Grafana
+# 🚀 Упрощенный скрипт установки Remnawave Node + Caddy Selfsteal + Wildcard + Netbird + Grafana
 
 Автоматизированный скрипт для быстрой установки и настройки Remnawave Node, Caddy Selfsteal, Netbird VPN и мониторинга Grafana на Linux сервере для Remnawave Panel.
 
