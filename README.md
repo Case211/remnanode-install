@@ -386,7 +386,7 @@ MIT License
 
 ## 📚 Полезные ссылки
 
-- [Remnawave Documentation](https://wiki.egam.es/)
+- [Remnawave Documentation](https://docs.rw/)
 - [Caddy Documentation](https://caddyserver.com/docs/)
 - [Netbird Documentation](https://docs.netbird.io/)
 - [Grafana Monitoring Setup](https://wiki.egam.es/ru/configuration/grafana-monitoring-setup/)
