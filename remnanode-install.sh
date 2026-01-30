@@ -1714,6 +1714,168 @@ EOF
     echo
 }
 
+# Применение сетевых настроек
+apply_network_settings() {
+    echo
+    echo -e "${WHITE}🌐 Оптимизация сетевых настроек${NC}"
+    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
+    echo
+
+    read -p "Применить оптимизацию сетевых настроек (BBR, TCP tuning, лимиты)? (y/n): " -r apply_network_choice
+    if [[ ! $apply_network_choice =~ ^[Yy]$ ]]; then
+        log_info "Оптимизация сетевых настроек пропущена"
+        return 0
+    fi
+
+    log_info "Применение сетевых настроек..."
+
+    # Создание файла конфигурации sysctl
+    local sysctl_file="/etc/sysctl.d/99-remnawave-tuning.conf"
+
+    # Проверка существующего файла
+    if [ -f "$sysctl_file" ]; then
+        echo
+        echo -e "${YELLOW}⚠️  Файл конфигурации уже существует${NC}"
+        echo -e "${GRAY}   Путь: $sysctl_file${NC}"
+        echo
+        echo -e "${WHITE}Выберите действие:${NC}"
+        echo -e "   ${WHITE}1)${NC} ${GRAY}Пропустить (оставить текущие настройки)${NC}"
+        echo -e "   ${WHITE}2)${NC} ${YELLOW}Перезаписать настройки${NC}"
+        echo
+        read -p "Выберите опцию [1-2]: " sysctl_choice
+
+        if [ "$sysctl_choice" = "1" ]; then
+            log_info "Сетевые настройки не изменены"
+            return 0
+        fi
+    fi
+
+    # Проверка поддержки BBR
+    log_info "Проверка поддержки BBR..."
+    if ! grep -q "tcp_bbr" /proc/modules 2>/dev/null && ! modprobe tcp_bbr 2>/dev/null; then
+        log_warning "Модуль BBR не найден, пробуем загрузить..."
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+
+    if lsmod | grep -q tcp_bbr 2>/dev/null; then
+        log_success "Модуль BBR загружен"
+    else
+        log_warning "BBR может быть недоступен на этом ядре"
+    fi
+
+    # Создание конфигурационного файла
+    log_info "Создание конфигурации sysctl..."
+
+    cat > "$sysctl_file" << 'EOF'
+# ╔════════════════════════════════════════════════════════════════╗
+# ║  Remnawave Network Tuning Configuration                        ║
+# ║  Оптимизация сети для VPN/Proxy нод                           ║
+# ╚════════════════════════════════════════════════════════════════╝
+
+# === IPv6 (Отключен для стабильности) ===
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+
+# === IPv4 и Маршрутизация ===
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+
+# === Оптимизация TCP и BBR ===
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_max_tw_buckets = 262144
+net.ipv4.tcp_max_syn_backlog = 8192
+net.core.somaxconn = 8192
+
+# === TCP Keepalive ===
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 15
+
+# === Буферы сокетов (16 MB) ===
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+
+# === Безопасность ===
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv4.tcp_syncookies = 1
+
+# === Системные лимиты ===
+fs.file-max = 2097152
+vm.swappiness = 10
+vm.overcommit_memory = 1
+EOF
+
+    log_success "Конфигурация sysctl создана: $sysctl_file"
+
+    # Применение настроек
+    log_info "Применение настроек sysctl..."
+    if sysctl -p "$sysctl_file" >/dev/null 2>&1; then
+        log_success "Настройки sysctl применены"
+    else
+        log_warning "Некоторые настройки могли не примениться (это нормально для некоторых систем)"
+        sysctl -p "$sysctl_file" 2>&1 | grep -i "error\|invalid" || true
+    fi
+
+    # Настройка лимитов файлов
+    log_info "Настройка лимитов файловых дескрипторов..."
+
+    local limits_file="/etc/security/limits.d/99-remnawave.conf"
+    cat > "$limits_file" << 'EOF'
+# Remnawave File Limits
+* soft nofile 1048576
+* hard nofile 1048576
+* soft nproc 65535
+* hard nproc 65535
+root soft nofile 1048576
+root hard nofile 1048576
+root soft nproc 65535
+root hard nproc 65535
+EOF
+
+    log_success "Лимиты файлов настроены: $limits_file"
+
+    # Настройка systemd лимитов
+    log_info "Настройка systemd лимитов..."
+
+    local systemd_conf="/etc/systemd/system.conf.d"
+    mkdir -p "$systemd_conf"
+    cat > "$systemd_conf/99-remnawave.conf" << 'EOF'
+[Manager]
+DefaultLimitNOFILE=1048576
+DefaultLimitNPROC=65535
+EOF
+
+    # Перезагрузка systemd
+    systemctl daemon-reexec 2>/dev/null || true
+
+    log_success "Systemd лимиты настроены"
+
+    # Проверка применённых настроек
+    echo
+    log_info "Проверка применённых настроек:"
+    echo -e "${GRAY}   BBR: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo 'не определено')${NC}"
+    echo -e "${GRAY}   IP Forward: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 'не определено')${NC}"
+    echo -e "${GRAY}   TCP FastOpen: $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 'не определено')${NC}"
+    echo -e "${GRAY}   File Max: $(sysctl -n fs.file-max 2>/dev/null || echo 'не определено')${NC}"
+    echo -e "${GRAY}   Somaxconn: $(sysctl -n net.core.somaxconn 2>/dev/null || echo 'не определено')${NC}"
+    echo
+
+    log_success "Оптимизация сетевых настроек завершена"
+    echo -e "${CYAN}   Для полного применения лимитов рекомендуется перезагрузка системы${NC}"
+}
+
 # Главная функция
 main() {
     clear
@@ -1730,7 +1892,12 @@ main() {
     
     log_info "Обнаружена ОС: $OS"
     echo
-    
+
+    # Применение сетевых настроек (BBR, TCP tuning, лимиты)
+    apply_network_settings
+
+    echo
+
     # Установка необходимых пакетов
     log_info "Проверка и установка необходимых пакетов..."
     if ! command -v curl >/dev/null 2>&1; then
