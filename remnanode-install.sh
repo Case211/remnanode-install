@@ -1831,23 +1831,32 @@ apply_network_settings() {
         fi
     fi
 
-    # Проверка поддержки BBR
-    log_info "Проверка поддержки BBR..."
-    if ! grep -q "tcp_bbr" /proc/modules 2>/dev/null && ! modprobe tcp_bbr 2>/dev/null; then
-        log_warning "Модуль BBR не найден, пробуем загрузить..."
-        modprobe tcp_bbr 2>/dev/null || true
+    # Проверка поддержки BBR2 (требует ядро 5.18+ или пропатченное)
+    log_info "Проверка поддержки BBR2..."
+    BBR_MODULE="tcp_bbr2"
+    BBR_ALGO="bbr2"
+
+    if ! grep -q "tcp_bbr2" /proc/modules 2>/dev/null && ! modprobe tcp_bbr2 2>/dev/null; then
+        log_warning "Модуль BBR2 не найден, пробуем BBR1 как fallback..."
+        BBR_MODULE="tcp_bbr"
+        BBR_ALGO="bbr"
+        if ! grep -q "tcp_bbr" /proc/modules 2>/dev/null && ! modprobe tcp_bbr 2>/dev/null; then
+            modprobe tcp_bbr 2>/dev/null || true
+        fi
     fi
 
-    if lsmod | grep -q tcp_bbr 2>/dev/null; then
-        log_success "Модуль BBR загружен"
+    if lsmod | grep -q "$BBR_MODULE" 2>/dev/null; then
+        log_success "Модуль ${BBR_MODULE} загружен"
     else
-        log_warning "BBR может быть недоступен на этом ядре"
+        log_warning "${BBR_MODULE} может быть недоступен на этом ядре"
     fi
+
+    log_info "Используется алгоритм: ${BBR_ALGO}"
 
     # Создание конфигурационного файла
     log_info "Создание конфигурации sysctl..."
 
-    cat > "$sysctl_file" << 'EOF'
+    cat > "$sysctl_file" << EOF
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  Remnawave Network Tuning Configuration                        ║
 # ║  Оптимизация сети для VPN/Proxy нод                           ║
@@ -1865,9 +1874,9 @@ net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 
-# === Оптимизация TCP и BBR ===
+# === Оптимизация TCP и BBR2 ===
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_congestion_control = ${BBR_ALGO}
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_max_tw_buckets = 262144
