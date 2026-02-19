@@ -7,6 +7,11 @@
 
 set -euo pipefail
 
+# Логирование в файл (дублирует весь вывод в лог, полезно при обрыве SSH-сессии)
+INSTALL_LOG="/var/log/remnanode-install.log"
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+echo "--- Начало установки: $(date) ---" >> "$INSTALL_LOG"
+
 # Обработка ошибок
 trap 'log_error "Ошибка на строке $LINENO. Команда: $BASH_COMMAND"' ERR
 
@@ -14,7 +19,6 @@ trap 'log_error "Ошибка на строке $LINENO. Команда: $BASH_C
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
 readonly CYAN='\033[0;36m'
 readonly WHITE='\033[1;37m'
 readonly GRAY='\033[0;37m'
@@ -28,6 +32,9 @@ CADDY_DIR="$INSTALL_DIR/caddy"
 CADDY_HTML_DIR="$CADDY_DIR/html"
 CADDY_VERSION="2.10.2"
 CADDY_IMAGE="caddy:${CADDY_VERSION}"
+CADVISOR_VERSION="v0.53.0"
+NODE_EXPORTER_VERSION="1.9.1"
+VMAGENT_VERSION="v1.123.0"
 DEFAULT_PORT="9443"
 USE_WILDCARD=false
 USE_EXISTING_CERT=false
@@ -37,14 +44,15 @@ CLOUDFLARE_API_TOKEN=""
 # Получение IP сервера
 get_server_ip() {
     local ip
-    ip=$(curl -s -4 --connect-timeout 5 ifconfig.io 2>/dev/null) || \
-    ip=$(curl -s -4 --connect-timeout 5 icanhazip.com 2>/dev/null) || \
-    ip=$(curl -s -4 --connect-timeout 5 ipecho.net/plain 2>/dev/null) || \
+    ip=$(curl -s -4 --connect-timeout 5 ifconfig.io 2>/dev/null | tr -d '[:space:]') || \
+    ip=$(curl -s -4 --connect-timeout 5 icanhazip.com 2>/dev/null | tr -d '[:space:]') || \
+    ip=$(curl -s -4 --connect-timeout 5 ipecho.net/plain 2>/dev/null | tr -d '[:space:]') || \
     ip="127.0.0.1"
     echo "${ip:-127.0.0.1}"
 }
 
-NODE_IP=$(get_server_ip)
+# NODE_IP инициализируется в main() после check_root
+NODE_IP=""
 
 # Функции логирования
 log_info() {
@@ -76,12 +84,12 @@ detect_os() {
     if [ -f /etc/lsb-release ]; then
         OS=$(lsb_release -si)
     elif [ -f /etc/os-release ]; then
-        OS=$(awk -F= '/^NAME/{print $2}' /etc/os-release | tr -d '"')
+        OS=$(awk -F= '/^NAME=/{print $2}' /etc/os-release | tr -d '"')
         if [[ "$OS" == "Amazon Linux" ]]; then
             OS="Amazon"
         fi
     elif [ -f /etc/redhat-release ]; then
-        OS=$(cat /etc/redhat-release | awk '{print $1}')
+        OS=$(awk '{print $1}' /etc/redhat-release)
     elif [ -f /etc/arch-release ]; then
         OS="Arch"
     else
@@ -115,7 +123,7 @@ install_package() {
     # Для Ubuntu/Debian проверяем блокировку перед установкой
     if [[ "$OS" == "Ubuntu"* ]] || [[ "$OS" == "Debian"* ]]; then
         # Быстрая проверка блокировки
-        if pgrep -x unattended-upgr >/dev/null 2>&1; then
+        if is_dpkg_locked; then
             log_warning "Обнаружен процесс обновления системы. Ожидание..."
             if ! wait_for_dpkg_lock; then
                 log_error "Не удалось дождаться освобождения пакетного менеджера"
@@ -123,9 +131,14 @@ install_package() {
                 return 1
             fi
         fi
-        
-        if $PKG_MANAGER update -qq >"$install_log" 2>&1 && \
-           $PKG_MANAGER install -y -qq "$package" >>"$install_log" 2>&1; then
+
+        # apt-get update выполняется один раз, потом кешируется флагом
+        if [ "${_APT_UPDATED:-}" != "true" ]; then
+            $PKG_MANAGER update -qq >"$install_log" 2>&1 || true
+            _APT_UPDATED=true
+        fi
+
+        if $PKG_MANAGER install -y -qq "$package" >>"$install_log" 2>&1; then
             install_success=true
         else
             # Проверяем если это ошибка lock
@@ -135,8 +148,7 @@ install_package() {
                     log_info "Повторная попытка установки $package..."
                     rm -f "$install_log"
                     install_log=$(mktemp)
-                    if $PKG_MANAGER update -qq >"$install_log" 2>&1 && \
-                       $PKG_MANAGER install -y -qq "$package" >>"$install_log" 2>&1; then
+                    if $PKG_MANAGER install -y -qq "$package" >>"$install_log" 2>&1; then
                         install_success=true
                     fi
                 fi
@@ -170,76 +182,161 @@ install_package() {
     return 0
 }
 
+# Проверка, заблокирован ли пакетный менеджер
+is_dpkg_locked() {
+    # Проверяем процессы, которые могут держать lock (точное совпадение имени процесса)
+    if pgrep -x 'dpkg' >/dev/null 2>&1 || \
+       pgrep -x 'apt-get' >/dev/null 2>&1 || \
+       pgrep -x 'apt' >/dev/null 2>&1 || \
+       pgrep -x 'aptitude' >/dev/null 2>&1 || \
+       pgrep -f 'unattended-upgr' >/dev/null 2>&1 || \
+       pgrep -f 'apt.systemd.daily' >/dev/null 2>&1; then
+        return 0  # Заблокирован
+    fi
+
+    # Проверяем lock файлы через fuser
+    if command -v fuser >/dev/null 2>&1; then
+        if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+           fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+           fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+            return 0  # Заблокирован
+        fi
+    fi
+
+    # Проверяем lock файлы через lsof
+    if command -v lsof >/dev/null 2>&1; then
+        if lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+           lsof /var/lib/dpkg/lock >/dev/null 2>&1; then
+            return 0  # Заблокирован
+        fi
+    fi
+
+    return 1  # Свободен
+}
+
 # Ожидание освобождения dpkg lock
 wait_for_dpkg_lock() {
     log_info "Проверка доступности пакетного менеджера..."
     local max_wait=300  # Максимум 5 минут
     local waited=0
-    
-    # Функция проверки блокировки
-    check_lock() {
-        # Проверяем процессы unattended-upgrades
-        if pgrep -x unattended-upgr >/dev/null 2>&1; then
-            return 1  # Заблокирован
-        fi
-        
-        # Проверяем lock файлы через lsof если доступен
-        if command -v lsof >/dev/null 2>&1; then
-            if lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-               lsof /var/lib/dpkg/lock >/dev/null 2>&1; then
-                return 1  # Заблокирован
-            fi
-        fi
-        
-        # Проверяем через fuser если доступен
-        if command -v fuser >/dev/null 2>&1; then
-            if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-               fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
-                return 1  # Заблокирован
-            fi
-        fi
-        
-        # Пробуем проверить через попытку обновления (быстрая проверка)
-        if ! dpkg --configure -a >/dev/null 2>&1; then
-            # Если команда вернула ошибку, проверяем причину
-            if dpkg --configure -a 2>&1 | grep -q "lock"; then
-                return 1  # Заблокирован
-            fi
-        fi
-        
-        return 0  # Свободен
-    }
-    
+
     # Если уже свободен, возвращаемся сразу
-    if check_lock; then
+    if ! is_dpkg_locked; then
         return 0
     fi
-    
+
     log_warning "Пакетный менеджер заблокирован другим процессом (вероятно, обновление системы)"
     log_info "Ожидание освобождения..."
-    
+
     while [ $waited -lt $max_wait ]; do
-        if check_lock; then
-            log_success "Пакетный менеджер свободен"
-            return 0
+        if ! is_dpkg_locked; then
+            # Дополнительно проверяем, что dpkg --configure -a проходит
+            if dpkg --configure -a >/dev/null 2>&1; then
+                log_success "Пакетный менеджер свободен"
+                return 0
+            fi
         fi
-        
+
         sleep 5
         waited=$((waited + 5))
-        
+
         # Показываем прогресс каждые 30 секунд
         if [ $((waited % 30)) -eq 0 ]; then
             log_info "Ожидание... ($waited/$max_wait сек)"
-            log_info "   Можно завершить процесс обновления: sudo killall unattended-upgr"
         fi
     done
-    
+
     log_error "Не удалось дождаться освобождения пакетного менеджера (ожидалось $max_wait сек)"
-    log_error "Завершите процесс обновления системы:"
-    log_error "   sudo killall unattended-upgr"
-    log_error "   sudo systemctl stop unattended-upgrades"
-    log_error "Или подождите завершения обновления и запустите скрипт снова"
     return 1
+}
+
+# Проактивная очистка блокировок пакетного менеджера перед установкой
+# Останавливает автоматические обновления и ждёт освобождения lock
+ensure_package_manager_available() {
+    # Только для Debian/Ubuntu
+    if [[ "$PKG_MANAGER" != "apt-get" ]]; then
+        return 0
+    fi
+
+    log_info "Подготовка пакетного менеджера..."
+
+    # Останавливаем службы автоматических обновлений
+    local services_to_stop=("unattended-upgrades" "apt-daily.service" "apt-daily-upgrade.service")
+    for svc in "${services_to_stop[@]}"; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            log_info "Остановка $svc..."
+            systemctl stop "$svc" 2>/dev/null || true
+            systemctl disable "$svc" 2>/dev/null || true
+        fi
+    done
+
+    # Останавливаем таймеры автообновлений
+    local timers_to_stop=("apt-daily.timer" "apt-daily-upgrade.timer")
+    for timer in "${timers_to_stop[@]}"; do
+        if systemctl is-active --quiet "$timer" 2>/dev/null; then
+            log_info "Остановка таймера $timer..."
+            systemctl stop "$timer" 2>/dev/null || true
+            systemctl disable "$timer" 2>/dev/null || true
+        fi
+    done
+
+    # Если lock всё ещё занят — завершаем мешающие процессы
+    if is_dpkg_locked; then
+        log_warning "Пакетный менеджер заблокирован. Завершение мешающих процессов..."
+
+        # Даём текущим операциям 30 секунд на завершение
+        local grace_wait=0
+        while is_dpkg_locked && [ $grace_wait -lt 30 ]; do
+            sleep 2
+            grace_wait=$((grace_wait + 2))
+        done
+
+        # Если всё ещё заблокирован — принудительно завершаем
+        if is_dpkg_locked; then
+            log_warning "Принудительное завершение процессов, блокирующих пакетный менеджер..."
+            killall -9 unattended-upgr 2>/dev/null || true
+            killall -9 apt-get 2>/dev/null || true
+            killall -9 apt 2>/dev/null || true
+            sleep 2
+
+            # Удаляем stale lock файлы
+            rm -f /var/lib/dpkg/lock-frontend 2>/dev/null || true
+            rm -f /var/lib/dpkg/lock 2>/dev/null || true
+            rm -f /var/lib/apt/lists/lock 2>/dev/null || true
+            rm -f /var/cache/apt/archives/lock 2>/dev/null || true
+
+            # Восстанавливаем dpkg после прерывания
+            dpkg --configure -a >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # Финальная проверка
+    if is_dpkg_locked; then
+        log_error "Не удалось освободить пакетный менеджер"
+        return 1
+    fi
+
+    log_success "Пакетный менеджер готов к работе"
+    return 0
+}
+
+# Восстановление служб автоматических обновлений после установки
+restore_auto_updates() {
+    if [[ "${PKG_MANAGER:-}" != "apt-get" ]]; then
+        return 0
+    fi
+
+    log_info "Восстановление служб автоматических обновлений..."
+    local services=("unattended-upgrades" "apt-daily.service" "apt-daily-upgrade.service")
+    local timers=("apt-daily.timer" "apt-daily-upgrade.timer")
+
+    for svc in "${services[@]}"; do
+        systemctl enable "$svc" 2>/dev/null || true
+    done
+    for timer in "${timers[@]}"; do
+        systemctl enable "$timer" 2>/dev/null || true
+        systemctl start "$timer" 2>/dev/null || true
+    done
 }
 
 # Установка Docker
@@ -253,8 +350,14 @@ install_docker() {
             log_warning "Docker установлен, но не запущен. Запускаем..."
             if command -v systemctl >/dev/null 2>&1; then
                 systemctl start docker >/dev/null 2>&1 || true
-                sleep 2
+                sleep 3
             fi
+            # Проверяем, удалось ли запустить
+            if docker ps >/dev/null 2>&1; then
+                log_success "Docker запущен"
+                return 0
+            fi
+            log_warning "Docker не отвечает после запуска, переустановка..."
         fi
     fi
     
@@ -278,7 +381,7 @@ install_docker() {
         local install_success=false
         
         # Пробуем установить Docker
-        if curl -fsSL https://get.docker.com 2>&1 | sh >"$docker_install_log" 2>&1; then
+        if curl -fsSL https://get.docker.com 2>/dev/null | sh >"$docker_install_log" 2>&1; then
             install_success=true
         else
             # Проверяем если это ошибка lock
@@ -288,7 +391,7 @@ install_docker() {
                     log_info "Повторная попытка установки Docker..."
                     rm -f "$docker_install_log"
                     docker_install_log=$(mktemp)
-                    if curl -fsSL https://get.docker.com 2>&1 | sh >"$docker_install_log" 2>&1; then
+                    if curl -fsSL https://get.docker.com 2>/dev/null | sh >"$docker_install_log" 2>&1; then
                         install_success=true
                     fi
                 fi
@@ -373,17 +476,17 @@ install_remnanode() {
         echo
         read -p "Выберите опцию [1-2]: " remnanode_choice
         
-        if [ "$remnanode_choice" = "1" ]; then
-            log_info "Установка RemnawaveNode пропущена"
-            return 0
-        else
+        if [ "$remnanode_choice" = "2" ]; then
             log_warning "Удаление существующей установки RemnawaveNode..."
             if [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
-                cd "$REMNANODE_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
+                docker compose -f "$REMNANODE_DIR/docker-compose.yml" down 2>/dev/null || true
             fi
             rm -rf "$REMNANODE_DIR"
             log_success "Существующая установка удалена"
             echo
+        else
+            log_info "Установка RemnawaveNode пропущена"
+            return 0
         fi
     fi
     
@@ -404,7 +507,12 @@ install_remnanode() {
         fi
         SECRET_KEY_VALUE="$SECRET_KEY_VALUE$line"
     done
-    
+
+    if [ -z "$SECRET_KEY_VALUE" ]; then
+        log_error "SECRET_KEY не может быть пустым!"
+        exit 1
+    fi
+
     # Запрос порта
     echo
     read -p "Введите NODE_PORT (по умолчанию 3000): " -r NODE_PORT
@@ -443,7 +551,8 @@ NODE_PORT=$NODE_PORT
 ### XRAY ###
 SECRET_KEY=$SECRET_KEY_VALUE
 EOF
-    
+    chmod 600 "$REMNANODE_DIR/.env"
+
     log_success ".env файл создан"
     
     # Создание docker-compose.yml
@@ -489,7 +598,15 @@ EOF
     log_info "Запуск RemnawaveNode..."
     cd "$REMNANODE_DIR"
     docker compose up -d
-    log_success "RemnawaveNode запущен"
+
+    # Проверка что контейнер поднялся
+    sleep 3
+    if docker compose ps 2>/dev/null | grep -qE "Up|running"; then
+        log_success "RemnawaveNode запущен"
+    else
+        log_warning "RemnawaveNode может не запуститься корректно. Проверьте логи:"
+        log_warning "   cd $REMNANODE_DIR && docker compose logs"
+    fi
 }
 
 # Установка Xray-core
@@ -497,20 +614,21 @@ install_xray_core() {
     log_info "Установка Xray-core..."
     
     # Определение архитектуры
+    local ARCH
     ARCH=$(uname -m)
     log_info "Обнаружена архитектура: $ARCH"
-    
+
     case "$ARCH" in
         x86_64) ARCH="64" ;;
         aarch64|arm64) ARCH="arm64-v8a" ;;
         armv7l|armv6l) ARCH="arm32-v7a" ;;
-        *) 
+        *)
             log_error "Неподдерживаемая архитектура: $ARCH"
             log_error "Поддерживаемые архитектуры: x86_64, aarch64, arm64, armv7l, armv6l"
             return 1
             ;;
     esac
-    
+
     log_info "Используется архитектура для Xray: $ARCH"
     
     # Установка unzip если нужно
@@ -542,15 +660,15 @@ install_xray_core() {
     local latest_release=""
     local api_response=""
     
-    api_response=$(curl -s --connect-timeout 10 --max-time 30 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>&1)
-    
-    if [ $? -ne 0 ] || [ -z "$api_response" ]; then
+    api_response=$(curl -s --connect-timeout 10 --max-time 30 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null) || true
+
+    if [ -z "$api_response" ]; then
         log_error "Не удалось подключиться к GitHub API"
         log_error "Проверьте интернет-соединение и попробуйте снова"
         return 1
     fi
     
-    latest_release=$(echo "$api_response" | grep -oP '"tag_name": "\K(.*?)(?=")' | head -1)
+    latest_release=$(echo "$api_response" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
     
     if [ -z "$latest_release" ]; then
         log_error "Не удалось получить версию Xray-core из ответа API"
@@ -561,47 +679,38 @@ install_xray_core() {
     log_success "Найдена версия Xray-core: $latest_release"
     
     # Скачивание
-    xray_filename="Xray-linux-$ARCH.zip"
-    xray_download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_release}/${xray_filename}"
+    local xray_filename="Xray-linux-$ARCH.zip"
+    local xray_download_url="https://github.com/XTLS/Xray-core/releases/download/${latest_release}/${xray_filename}"
     
     log_info "Скачивание Xray-core версии ${latest_release}..."
     log_info "URL: $xray_download_url"
     
-    # Переходим в директорию данных
-    if ! cd "$REMNANODE_DATA_DIR"; then
-        log_error "Не удалось перейти в директорию: $REMNANODE_DATA_DIR"
+    # Скачиваем файл в директорию данных
+    if ! wget --timeout=30 --tries=3 "${xray_download_url}" -q -O "${REMNANODE_DATA_DIR}/${xray_filename}"; then
+        log_error "Не удалось скачать Xray-core"
+        log_error "Проверьте интернет-соединение и доступность GitHub"
         return 1
     fi
     
-    # Скачиваем файл
-    if ! wget --timeout=30 --tries=3 "${xray_download_url}" -q --show-progress 2>&1 | grep -v "^$" || \
-       [ ! -f "${xray_filename}" ]; then
-        # Если wget с --show-progress не работает, пробуем без него
-        if ! wget --timeout=30 --tries=3 "${xray_download_url}" -q; then
-            log_error "Не удалось скачать Xray-core"
-            log_error "Проверьте интернет-соединение и доступность GitHub"
-            return 1
-        fi
-    fi
-    
-    if [ ! -f "${xray_filename}" ]; then
+    if [ ! -f "${REMNANODE_DATA_DIR}/${xray_filename}" ]; then
         log_error "Файл ${xray_filename} не найден после скачивания"
         return 1
     fi
-    
-    local file_size=$(stat -f%z "${xray_filename}" 2>/dev/null || stat -c%s "${xray_filename}" 2>/dev/null || echo "unknown")
+
+    local file_size
+    file_size=$(stat -c%s "${REMNANODE_DATA_DIR}/${xray_filename}" 2>/dev/null || echo "unknown")
     log_success "Файл скачан (размер: ${file_size} байт)"
-    
+
     # Распаковка
     log_info "Распаковка Xray-core..."
-    if ! unzip -o "${xray_filename}" -d "$REMNANODE_DATA_DIR" >/dev/null 2>&1; then
+    if ! unzip -o "${REMNANODE_DATA_DIR}/${xray_filename}" -d "$REMNANODE_DATA_DIR" >/dev/null 2>&1; then
         log_error "Не удалось распаковать архив"
-        rm -f "${xray_filename}"
+        rm -f "${REMNANODE_DATA_DIR}/${xray_filename}"
         return 1
     fi
-    
+
     # Удаляем архив
-    rm -f "${xray_filename}"
+    rm -f "${REMNANODE_DATA_DIR}/${xray_filename}"
     
     # Проверяем что xray файл существует
     if [ ! -f "$REMNANODE_DATA_DIR/xray" ]; then
@@ -675,17 +784,17 @@ download_template() {
     # Создание директории
     mkdir -p "$CADDY_HTML_DIR"
     rm -rf "${CADDY_HTML_DIR:?}"/* 2>/dev/null || true
-    cd "$CADDY_HTML_DIR"
-    
-    # Попытка загрузки через git
+
+    # Попытка загрузки через git (в подоболочке чтобы не менять рабочую директорию)
     if command -v git >/dev/null 2>&1; then
         local temp_dir="/tmp/selfsteal-template-$$"
         mkdir -p "$temp_dir"
-        
+
         if git clone --filter=blob:none --sparse "https://github.com/DigneZzZ/remnawave-scripts.git" "$temp_dir" 2>/dev/null; then
-            cd "$temp_dir"
-            git sparse-checkout set "sni-templates/$template_folder" 2>/dev/null
-            
+            (
+                cd "$temp_dir"
+                git sparse-checkout set "sni-templates/$template_folder" 2>/dev/null
+            )
             local source_path="$temp_dir/sni-templates/$template_folder"
             if [ -d "$source_path" ] && cp -r "$source_path"/* "$CADDY_HTML_DIR/" 2>/dev/null; then
                 rm -rf "$temp_dir"
@@ -695,25 +804,25 @@ download_template() {
         fi
         rm -rf "$temp_dir"
     fi
-    
+
     # Fallback: загрузка основных файлов через curl
     log_info "Использование fallback метода загрузки..."
     local base_url="https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/sni-templates/$template_folder"
     local common_files=("index.html" "favicon.ico")
-    
+
     local files_downloaded=0
     for file in "${common_files[@]}"; do
         local url="$base_url/$file"
-        if curl -fsSL "$url" -o "$file" 2>/dev/null; then
-            ((files_downloaded++))
+        if curl -fsSL "$url" -o "$CADDY_HTML_DIR/$file" 2>/dev/null; then
+            files_downloaded=$((files_downloaded + 1))
         fi
     done
-    
+
     if [ $files_downloaded -gt 0 ]; then
         log_success "Базовые файлы шаблона загружены"
         return 0
     fi
-    
+
     # Создание простого fallback HTML
     create_fallback_html
     return 1
@@ -749,23 +858,24 @@ check_existing_certificate() {
     
     # Проверка сертификатов Caddy (в volume)
     if docker volume inspect caddy_data >/dev/null 2>&1; then
-        # Проверяем через временный контейнер
+        # Проверяем через временный контейнер (домен передаётся через аргументы, не через sh -c)
         if docker run --rm \
             -v caddy_data:/data:ro \
             alpine:latest \
-            sh -c "find /data/caddy/certificates -type d -name '*$domain_to_check*' -o -name '*$check_domain*' 2>/dev/null | head -1" 2>/dev/null | grep -q .; then
+            sh -c 'find /data/caddy/certificates -type d -name "*'"$1"'*" 2>/dev/null | head -1' _ "$domain_to_check" 2>/dev/null | grep -q .; then
             cert_found=true
             cert_location="Caddy volume (caddy_data)"
         fi
     fi
-    
+
     # Проверка существующих контейнеров Caddy
-    local existing_caddy=$(docker ps -a --format '{{.Names}}' | grep -E '^caddy' | head -1)
+    local existing_caddy
+    existing_caddy=$(docker ps -a --format '{{.Names}}' | grep -E '^caddy' | head -1) || true
     if [ -n "$existing_caddy" ]; then
         # Проверяем доступность контейнера
-        if docker exec "$existing_caddy" sh -c "test -d /data/caddy/certificates" >/dev/null 2>&1; then
+        if docker exec "$existing_caddy" test -d /data/caddy/certificates >/dev/null 2>&1; then
             # Ищем сертификаты для домена
-            if docker exec "$existing_caddy" sh -c "find /data/caddy/certificates -type d \( -name '*$domain_to_check*' -o -name '*$check_domain*' \) 2>/dev/null" | grep -q .; then
+            if docker exec "$existing_caddy" find /data/caddy/certificates -type d -name "*${domain_to_check}*" 2>/dev/null | grep -q .; then
                 cert_found=true
                 if [ -z "$cert_location" ]; then
                     cert_location="Существующий контейнер Caddy ($existing_caddy)"
@@ -849,17 +959,17 @@ install_caddy_selfsteal() {
         echo
         read -p "Выберите опцию [1-2]: " caddy_choice
         
-        if [ "$caddy_choice" = "1" ]; then
-            log_info "Установка Caddy Selfsteal пропущена"
-            return 0
-        else
+        if [ "$caddy_choice" = "2" ]; then
             log_warning "Удаление существующей установки Caddy..."
             if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
-                cd "$CADDY_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
+                docker compose -f "$CADDY_DIR/docker-compose.yml" down 2>/dev/null || true
             fi
             rm -rf "$CADDY_DIR"
             log_success "Существующая установка удалена"
             echo
+        else
+            log_info "Установка Caddy Selfsteal пропущена"
+            return 0
         fi
     fi
     
@@ -907,7 +1017,8 @@ install_caddy_selfsteal() {
         echo
         
         while [ -z "$CLOUDFLARE_API_TOKEN" ]; do
-            read -p "Введите Cloudflare API Token: " -r CLOUDFLARE_API_TOKEN
+            read -s -p "Введите Cloudflare API Token: " -r CLOUDFLARE_API_TOKEN
+            echo
             if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
                 log_error "API Token не может быть пустым!"
             fi
@@ -1020,8 +1131,9 @@ EOF
         echo "# Using existing certificate from: $EXISTING_CERT_LOCATION" >> "$CADDY_DIR/.env"
     fi
     
+    chmod 600 "$CADDY_DIR/.env"
     log_success ".env файл создан"
-    
+
     # Создание docker-compose.yml
     cat > "$CADDY_DIR/docker-compose.yml" << EOF
 services:
@@ -1035,25 +1147,9 @@ services:
       - ./logs:/var/log/caddy
 EOF
 
-    # Если используется существующий сертификат, монтируем существующий volume
-    if [ "$USE_EXISTING_CERT" = true ]; then
-        # Проверяем существующий volume или создаем новый
-        if docker volume inspect caddy_data >/dev/null 2>&1; then
-            log_info "Используется существующий volume caddy_data для сертификатов"
-            cat >> "$CADDY_DIR/docker-compose.yml" << EOF
+    cat >> "$CADDY_DIR/docker-compose.yml" << EOF
       - caddy_data:/data
 EOF
-        else
-            log_info "Создается новый volume caddy_data для сертификатов"
-            cat >> "$CADDY_DIR/docker-compose.yml" << EOF
-      - caddy_data:/data
-EOF
-        fi
-    else
-        cat >> "$CADDY_DIR/docker-compose.yml" << EOF
-      - caddy_data:/data
-EOF
-    fi
 
     cat >> "$CADDY_DIR/docker-compose.yml" << EOF
       - caddy_config:/config
@@ -1079,7 +1175,9 @@ EOF
 
 volumes:
   caddy_data:
+    name: caddy_data
   caddy_config:
+    name: caddy_config
 EOF
     
     log_success "docker-compose.yml создан"
@@ -1087,22 +1185,13 @@ EOF
     # Создание Caddyfile
     if [ "$USE_WILDCARD" = true ]; then
         # Caddyfile с DNS-01 challenge для wildcard
-        # Используем переменную окружения из .env файла
         cat > "$CADDY_DIR/Caddyfile" << EOF
 {
 	https_port {\$SELF_STEAL_PORT}
 	default_bind 127.0.0.1
-	servers {
-		listener_wrappers {
-			proxy_protocol {
-				allow 127.0.0.1/32
-			}
-			tls
-		}
-	}
 	auto_https disable_redirects
 	log {
-		output file /var/log/caddy/access.log {
+		output file /var/log/caddy/default.log {
 			roll_size 10MB
 			roll_keep 5
 			roll_keep_for 720h
@@ -1112,9 +1201,9 @@ EOF
 	}
 }
 
-http://{\$SELF_STEAL_DOMAIN} {
+:80 {
 	bind 0.0.0.0
-	redir https://{\$SELF_STEAL_DOMAIN}{uri} permanent
+	redir https://{host}{uri} permanent
 	log {
 		output file /var/log/caddy/redirect.log {
 			roll_size 5MB
@@ -1125,18 +1214,9 @@ http://{\$SELF_STEAL_DOMAIN} {
 }
 
 https://{\$SELF_STEAL_DOMAIN} {
-EOF
-
-        # Добавляем tls с dns только если не используется существующий сертификат
-        if [ "$USE_EXISTING_CERT" != true ]; then
-            cat >> "$CADDY_DIR/Caddyfile" << EOF
 	tls {
 		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
 	}
-EOF
-        fi
-
-        cat >> "$CADDY_DIR/Caddyfile" << EOF
 	root * /var/www/html
 	try_files {path} /index.html
 	file_server
@@ -1147,21 +1227,8 @@ EOF
 			roll_keep_for 720h
 		}
 		level ERROR
+		format json
 	}
-}
-
-# Блок для внутреннего порта - использует internal сертификат
-# Используем отдельный адрес чтобы избежать конфликта с политикой сертификатов
-localhostlocalhost:{\$SELF_STEAL_PORT} {
-	tls internal
-	respond 204
-	log off
-}
-
-:80 {
-	bind 0.0.0.0
-	respond 204
-	log off
 }
 EOF
     else
@@ -1170,17 +1237,9 @@ EOF
 {
 	https_port {\$SELF_STEAL_PORT}
 	default_bind 127.0.0.1
-	servers {
-		listener_wrappers {
-			proxy_protocol {
-				allow 127.0.0.1/32
-			}
-			tls
-		}
-	}
 	auto_https disable_redirects
 	log {
-		output file /var/log/caddy/access.log {
+		output file /var/log/caddy/default.log {
 			roll_size 10MB
 			roll_keep 5
 			roll_keep_for 720h
@@ -1192,7 +1251,7 @@ EOF
 
 http://{\$SELF_STEAL_DOMAIN} {
 	bind 0.0.0.0
-	redir https://{\$SELF_STEAL_DOMAIN}{uri} permanent
+	redir https://{host}{uri} permanent
 	log {
 		output file /var/log/caddy/redirect.log {
 			roll_size 5MB
@@ -1213,13 +1272,8 @@ https://{\$SELF_STEAL_DOMAIN} {
 			roll_keep_for 720h
 		}
 		level ERROR
+		format json
 	}
-}
-
-localhost:{\$SELF_STEAL_PORT} {
-	tls internal
-	respond 204
-	log off
 }
 
 :80 {
@@ -1242,12 +1296,44 @@ EOF
     
     download_template "$template_folder" "Template $template_id" || true
     
+    # Проверка занятости портов перед запуском
+    log_info "Проверка доступности портов..."
+    local port_conflict=false
+    if ss -tlnp 2>/dev/null | grep -q ":80 "; then
+        local port80_proc
+        port80_proc=$(ss -tlnp 2>/dev/null | grep ":80 " | head -1)
+        log_warning "Порт 80 уже занят: $port80_proc"
+        port_conflict=true
+    fi
+    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        local port_proc
+        port_proc=$(ss -tlnp 2>/dev/null | grep ":${port} " | head -1)
+        log_warning "Порт $port уже занят: $port_proc"
+        port_conflict=true
+    fi
+    if [ "$port_conflict" = true ]; then
+        echo
+        read -p "Порты заняты. Продолжить запуск Caddy? (y/n): " -r force_start
+        if [[ ! $force_start =~ ^[Yy]$ ]]; then
+            log_warning "Запуск Caddy отложен. Запустите вручную: cd $CADDY_DIR && docker compose up -d"
+            return 0
+        fi
+    fi
+
     # Запуск Caddy
     log_info "Запуск Caddy..."
     cd "$CADDY_DIR"
     docker compose up -d
-    log_success "Caddy запущен"
-    
+
+    # Проверка что контейнер поднялся
+    sleep 3
+    if docker compose ps 2>/dev/null | grep -qE "Up|running"; then
+        log_success "Caddy запущен"
+    else
+        log_warning "Caddy может не запуститься корректно. Проверьте логи:"
+        log_warning "   cd $CADDY_DIR && docker compose logs"
+    fi
+
     # Вывод итоговой информации
     echo
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
@@ -1265,7 +1351,7 @@ EOF
     else
         echo -e "${GRAY}   serverNames: [\"$original_domain\"]${NC}"
     fi
-    echo -e "${GRAY}   target: \"127.0.0.1:$port\"${NC}"
+    echo -e "${GRAY}   dest: \"127.0.0.1:$port\"${NC}"
     echo -e "${GRAY}   xver: 0${NC}"
     echo
     echo -e "${WHITE}📁 Пути установки:${NC}"
@@ -1361,7 +1447,7 @@ install_netbird() {
     
     # Установка через официальный скрипт
     local install_log=$(mktemp)
-    if curl -fsSL https://pkgs.netbird.io/install.sh 2>&1 | sh >"$install_log" 2>&1; then
+    if curl -fsSL https://pkgs.netbird.io/install.sh 2>/dev/null | sh >"$install_log" 2>&1; then
         rm -f "$install_log"
         log_success "Netbird установлен"
     else
@@ -1396,18 +1482,17 @@ connect_netbird() {
     
     local setup_key=""
     while [ -z "$setup_key" ]; do
-        read -p "Введите Netbird Setup Key: " -r setup_key
+        read -s -p "Введите Netbird Setup Key: " -r setup_key
+        echo
         if [ -z "$setup_key" ]; then
             log_error "Setup Key не может быть пустым!"
         fi
     done
-    
+
     log_info "Подключение к Netbird..."
-    
+
     # Подключение
-    local connect_cmd="netbird up --setup-key $setup_key"
-    
-    if $connect_cmd 2>&1; then
+    if netbird up --setup-key "$setup_key" 2>&1; then
         log_success "Подключение к Netbird выполнено"
         
         # Проверка статуса
@@ -1485,69 +1570,65 @@ install_grafana_monitoring() {
     log_info "Установка компонентов мониторинга..."
     
     # Определение архитектуры
+    local ARCH
     ARCH=$(uname -m)
     case "$ARCH" in
         x86_64) ARCH="amd64" ;;
         aarch64|arm64) ARCH="arm64" ;;
         armv7l|armv6l) ARCH="armv7" ;;
-        *) 
+        *)
             log_error "Неподдерживаемая архитектура: $ARCH"
             log_error "Поддерживаемые архитектуры: x86_64, aarch64, arm64, armv7l, armv6l"
             return 1
             ;;
     esac
-    
+
     log_info "Обнаружена архитектура: $ARCH"
     
     # Создание директорий
     mkdir -p /opt/monitoring/{cadvisor,nodeexporter,vmagent/conf.d}
     
     # Установка cadvisor
-    log_info "Установка cAdvisor..."
-    cd /opt/monitoring/cadvisor
-    local cadvisor_version="v0.53.0"
-    local cadvisor_url="https://github.com/google/cadvisor/releases/download/${cadvisor_version}/cadvisor-${cadvisor_version}-linux-${ARCH}"
-    
-    if ! wget --timeout=30 --tries=3 "$cadvisor_url" -q -O cadvisor; then
+    log_info "Установка cAdvisor ${CADVISOR_VERSION}..."
+    local cadvisor_url="https://github.com/google/cadvisor/releases/download/${CADVISOR_VERSION}/cadvisor-${CADVISOR_VERSION}-linux-${ARCH}"
+
+    if ! wget --timeout=30 --tries=3 "$cadvisor_url" -q -O /opt/monitoring/cadvisor/cadvisor; then
         log_error "Не удалось скачать cAdvisor"
         return 1
     fi
-    chmod +x cadvisor
+    chmod +x /opt/monitoring/cadvisor/cadvisor
     log_success "cAdvisor установлен"
-    
+
     # Установка node_exporter
-    log_info "Установка Node Exporter..."
-    cd /opt/monitoring/nodeexporter
-    local node_exporter_version="1.9.1"
-    local node_exporter_url="https://github.com/prometheus/node_exporter/releases/download/v${node_exporter_version}/node_exporter-${node_exporter_version}.linux-${ARCH}.tar.gz"
-    
-    if ! wget --timeout=30 --tries=3 "$node_exporter_url" -q -O node_exporter.tar.gz; then
+    log_info "Установка Node Exporter ${NODE_EXPORTER_VERSION}..."
+    local ne_dir="/opt/monitoring/nodeexporter"
+    local node_exporter_url="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}.tar.gz"
+
+    if ! wget --timeout=30 --tries=3 "$node_exporter_url" -q -O "${ne_dir}/node_exporter.tar.gz"; then
         log_error "Не удалось скачать Node Exporter"
         return 1
     fi
-    
-    tar -xzf node_exporter.tar.gz
-    mv node_exporter-${node_exporter_version}.linux-${ARCH}/node_exporter ./
-    chmod +x node_exporter
-    rm -rf node_exporter-${node_exporter_version}.linux-${ARCH} node_exporter.tar.gz
+
+    tar -xzf "${ne_dir}/node_exporter.tar.gz" -C "${ne_dir}"
+    mv "${ne_dir}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}/node_exporter" "${ne_dir}/"
+    chmod +x "${ne_dir}/node_exporter"
+    rm -rf "${ne_dir}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}" "${ne_dir}/node_exporter.tar.gz"
     log_success "Node Exporter установлен"
-    
+
     # Установка vmagent
-    log_info "Установка VictoriaMetrics Agent..."
-    cd /opt/monitoring/vmagent
-    local vmagent_version="v1.123.0"
-    local vmagent_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/${vmagent_version}/vmutils-linux-${ARCH}-${vmagent_version}.tar.gz"
-    
-    if ! wget --timeout=30 --tries=3 "$vmagent_url" -q -O vmagent.tar.gz; then
+    log_info "Установка VictoriaMetrics Agent ${VMAGENT_VERSION}..."
+    local vm_dir="/opt/monitoring/vmagent"
+    local vmagent_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/${VMAGENT_VERSION}/vmutils-linux-${ARCH}-${VMAGENT_VERSION}.tar.gz"
+
+    if ! wget --timeout=30 --tries=3 "$vmagent_url" -q -O "${vm_dir}/vmagent.tar.gz"; then
         log_error "Не удалось скачать VictoriaMetrics Agent"
         return 1
     fi
-    
-    tar -xzf vmagent.tar.gz
-    mv vmagent-prod vmagent
-    find . ! -name 'vmagent' -type f -delete
-    chmod +x vmagent
-    rm -f vmagent.tar.gz
+
+    tar -xzf "${vm_dir}/vmagent.tar.gz" -C "${vm_dir}"
+    mv "${vm_dir}/vmagent-prod" "${vm_dir}/vmagent"
+    rm -f "${vm_dir}/vmagent.tar.gz" "${vm_dir}/vmalert-prod" "${vm_dir}/vmauth-prod" "${vm_dir}/vmbackup-prod" "${vm_dir}/vmrestore-prod" "${vm_dir}/vmctl-prod"
+    chmod +x "${vm_dir}/vmagent"
     log_success "VictoriaMetrics Agent установлен"
     
     # Запрос имени инстанса
@@ -1576,10 +1657,10 @@ install_grafana_monitoring() {
     # Создание конфигурации vmagent
     log_info "Создание конфигурации vmagent..."
     cat > /opt/monitoring/vmagent/scrape.yml << EOF
-scrape_config_files:
-  - "/opt/monitoring/vmagent/conf.d/*.yml"
 global:
   scrape_interval: 15s
+scrape_config_files:
+  - "/opt/monitoring/vmagent/conf.d/*.yml"
 EOF
     
     # Конфигурация cadvisor
@@ -1750,23 +1831,32 @@ apply_network_settings() {
         fi
     fi
 
-    # Проверка поддержки BBR
-    log_info "Проверка поддержки BBR..."
-    if ! grep -q "tcp_bbr" /proc/modules 2>/dev/null && ! modprobe tcp_bbr 2>/dev/null; then
-        log_warning "Модуль BBR не найден, пробуем загрузить..."
-        modprobe tcp_bbr 2>/dev/null || true
+    # Проверка поддержки BBR2 (требует ядро 5.18+ или пропатченное)
+    log_info "Проверка поддержки BBR2..."
+    BBR_MODULE="tcp_bbr2"
+    BBR_ALGO="bbr2"
+
+    if ! grep -q "tcp_bbr2" /proc/modules 2>/dev/null && ! modprobe tcp_bbr2 2>/dev/null; then
+        log_warning "Модуль BBR2 не найден, пробуем BBR1 как fallback..."
+        BBR_MODULE="tcp_bbr"
+        BBR_ALGO="bbr"
+        if ! grep -q "tcp_bbr" /proc/modules 2>/dev/null && ! modprobe tcp_bbr 2>/dev/null; then
+            modprobe tcp_bbr 2>/dev/null || true
+        fi
     fi
 
-    if lsmod | grep -q tcp_bbr 2>/dev/null; then
-        log_success "Модуль BBR загружен"
+    if lsmod | grep -q "$BBR_MODULE" 2>/dev/null; then
+        log_success "Модуль ${BBR_MODULE} загружен"
     else
-        log_warning "BBR может быть недоступен на этом ядре"
+        log_warning "${BBR_MODULE} может быть недоступен на этом ядре"
     fi
+
+    log_info "Используется алгоритм: ${BBR_ALGO}"
 
     # Создание конфигурационного файла
     log_info "Создание конфигурации sysctl..."
 
-    cat > "$sysctl_file" << 'EOF'
+    cat > "$sysctl_file" << EOF
 # ╔════════════════════════════════════════════════════════════════╗
 # ║  Remnawave Network Tuning Configuration                        ║
 # ║  Оптимизация сети для VPN/Proxy нод                           ║
@@ -1784,9 +1874,9 @@ net.ipv4.conf.default.rp_filter = 1
 net.ipv4.conf.all.accept_source_route = 0
 net.ipv4.conf.default.accept_source_route = 0
 
-# === Оптимизация TCP и BBR ===
+# === Оптимизация TCP и BBR2 ===
 net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_congestion_control = ${BBR_ALGO}
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_max_tw_buckets = 262144
@@ -1885,12 +1975,22 @@ main() {
     
     # Проверка root
     check_root
-    
+
+    # Получение IP сервера (после check_root, чтобы не тратить время на curl если не root)
+    NODE_IP=$(get_server_ip)
+
     # Определение ОС
     detect_os
     detect_package_manager
     
     log_info "Обнаружена ОС: $OS"
+    echo
+
+    # Проактивная очистка блокировок пакетного менеджера (apt lock, unattended-upgrades)
+    ensure_package_manager_available
+    # Гарантируем восстановление автообновлений даже при падении скрипта
+    trap 'restore_auto_updates' EXIT
+
     echo
 
     # Применение сетевых настроек (BBR, TCP tuning, лимиты)
@@ -1901,16 +2001,40 @@ main() {
     # Установка необходимых пакетов
     log_info "Проверка и установка необходимых пакетов..."
     if ! command -v curl >/dev/null 2>&1; then
-        install_package curl
+        if ! install_package curl; then
+            log_error "Не удалось установить curl"
+            exit 1
+        fi
         log_success "curl установлен"
     else
         log_success "curl уже установлен"
     fi
     if ! command -v wget >/dev/null 2>&1; then
-        install_package wget
+        if ! install_package wget; then
+            log_error "Не удалось установить wget"
+            exit 1
+        fi
         log_success "wget установлен"
     else
         log_success "wget уже установлен"
+    fi
+    if ! command -v nano >/dev/null 2>&1; then
+        if install_package nano; then
+            log_success "nano установлен"
+        else
+            log_warning "Не удалось установить nano (некритично)"
+        fi
+    else
+        log_success "nano уже установлен"
+    fi
+    if ! command -v btop >/dev/null 2>&1; then
+        if install_package btop; then
+            log_success "btop установлен"
+        else
+            log_warning "Не удалось установить btop (некритично)"
+        fi
+    else
+        log_success "btop уже установлен"
     fi
     echo
     
@@ -1944,8 +2068,113 @@ main() {
     install_grafana_monitoring
     
     echo
+
+    # Восстановление автоматических обновлений
+    restore_auto_updates
+
     log_success "Всё готово! Установка завершена."
 }
 
+# Вывод справки
+show_help() {
+    echo "Использование: $(basename "$0") [ОПЦИЯ]"
+    echo
+    echo "Автоматическая установка RemnawaveNode + Caddy Selfsteal + Netbird + Grafana мониторинг"
+    echo
+    echo "Опции:"
+    echo "  --help        Показать эту справку"
+    echo "  --uninstall   Удалить все компоненты"
+    echo "  (без опций)   Запустить установку"
+    echo
+    echo "Компоненты:"
+    echo "  - RemnawaveNode (Docker)     → $REMNANODE_DIR"
+    echo "  - Caddy Selfsteal (Docker)   → $CADDY_DIR"
+    echo "  - Netbird VPN"
+    echo "  - Grafana мониторинг         → /opt/monitoring"
+    echo
+    echo "Лог установки: $INSTALL_LOG"
+}
+
+# Удаление всех компонентов
+uninstall_all() {
+    check_root
+
+    echo -e "${RED}⚠️  Удаление всех компонентов Remnawave${NC}"
+    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
+    echo
+    echo "Будут удалены:"
+    echo "  - RemnawaveNode ($REMNANODE_DIR)"
+    echo "  - Caddy Selfsteal ($CADDY_DIR)"
+    echo "  - Мониторинг (/opt/monitoring)"
+    echo "  - Данные Xray ($REMNANODE_DATA_DIR)"
+    echo
+    echo -e "${YELLOW}Docker volumes (caddy_data, caddy_config) НЕ будут удалены.${NC}"
+    echo -e "${YELLOW}Netbird НЕ будет удалён (используйте: apt remove netbird).${NC}"
+    echo
+    read -p "Вы уверены? Введите 'YES' для подтверждения: " -r confirm
+    if [ "$confirm" != "YES" ]; then
+        echo "Отменено."
+        exit 0
+    fi
+
+    echo
+
+    # Остановка контейнеров
+    if [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
+        log_info "Остановка RemnawaveNode..."
+        docker compose -f "$REMNANODE_DIR/docker-compose.yml" down 2>/dev/null || true
+        log_success "RemnawaveNode остановлен"
+    fi
+
+    if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
+        log_info "Остановка Caddy..."
+        docker compose -f "$CADDY_DIR/docker-compose.yml" down 2>/dev/null || true
+        log_success "Caddy остановлен"
+    fi
+
+    # Остановка мониторинга
+    if systemctl is-active --quiet cadvisor 2>/dev/null || \
+       systemctl is-active --quiet nodeexporter 2>/dev/null || \
+       systemctl is-active --quiet vmagent 2>/dev/null; then
+        log_info "Остановка мониторинга..."
+        systemctl stop cadvisor nodeexporter vmagent 2>/dev/null || true
+        systemctl disable cadvisor nodeexporter vmagent 2>/dev/null || true
+        rm -f /etc/systemd/system/cadvisor.service
+        rm -f /etc/systemd/system/nodeexporter.service
+        rm -f /etc/systemd/system/vmagent.service
+        systemctl daemon-reload
+        log_success "Мониторинг остановлен"
+    fi
+
+    # Удаление директорий
+    log_info "Удаление файлов..."
+    rm -rf "$REMNANODE_DIR"
+    rm -rf "$REMNANODE_DATA_DIR"
+    rm -rf "$CADDY_DIR"
+    rm -rf /opt/monitoring
+
+    echo
+    log_success "Все компоненты удалены"
+    echo -e "${GRAY}Для удаления Docker volumes: docker volume rm caddy_data caddy_config${NC}"
+    echo -e "${GRAY}Для удаления Netbird: apt remove netbird (или yum remove netbird)${NC}"
+}
+
 # Запуск
-main "$@"
+case "${1:-}" in
+    --help|-h)
+        show_help
+        exit 0
+        ;;
+    --uninstall)
+        uninstall_all
+        exit 0
+        ;;
+    "")
+        main
+        ;;
+    *)
+        echo "Неизвестная опция: $1"
+        echo "Используйте --help для справки"
+        exit 1
+        ;;
+esac
