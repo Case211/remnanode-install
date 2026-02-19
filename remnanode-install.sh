@@ -7,13 +7,31 @@
 
 set -euo pipefail
 
-# Логирование в файл (дублирует весь вывод в лог, полезно при обрыве SSH-сессии)
+# Логирование в файл (ANSI-коды очищаются при выходе)
 INSTALL_LOG="/var/log/remnanode-install.log"
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 echo "--- Начало установки: $(date) ---" >> "$INSTALL_LOG"
 
-# Обработка ошибок
+# Отслеживание temp файлов для гарантированной очистки
+TEMP_FILES=()
+
+# Функция очистки при выходе
+_cleanup_on_exit() {
+    local exit_code=$?
+    # Очистка temp файлов
+    for f in "${TEMP_FILES[@]}"; do
+        rm -f "$f" 2>/dev/null || true
+    done
+    # Удаление ANSI-кодов из лог-файла для читаемости
+    if [ -f "$INSTALL_LOG" ]; then
+        sed -i 's/\x1b\[[0-9;]*m//g' "$INSTALL_LOG" 2>/dev/null || true
+    fi
+    return $exit_code
+}
+
+# Обработка ошибок и очистка
 trap 'log_error "Ошибка на строке $LINENO. Команда: $BASH_COMMAND"' ERR
+trap '_cleanup_on_exit' EXIT
 
 # Цвета
 readonly RED='\033[0;31m'
@@ -40,6 +58,42 @@ USE_WILDCARD=false
 USE_EXISTING_CERT=false
 EXISTING_CERT_LOCATION=""
 CLOUDFLARE_API_TOKEN=""
+
+# ═══════════════════════════════════════════════════════════════════
+#  Non-interactive режим (env переменные или конфиг-файл)
+# ═══════════════════════════════════════════════════════════════════
+NON_INTERACTIVE="${NON_INTERACTIVE:-false}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/remnanode-install.conf}"
+
+# Переменные для non-interactive режима
+CFG_SECRET_KEY="${CFG_SECRET_KEY:-}"
+CFG_NODE_PORT="${CFG_NODE_PORT:-3000}"
+CFG_INSTALL_XRAY="${CFG_INSTALL_XRAY:-y}"
+CFG_DOMAIN="${CFG_DOMAIN:-}"
+CFG_CERT_TYPE="${CFG_CERT_TYPE:-1}"
+CFG_CLOUDFLARE_TOKEN="${CFG_CLOUDFLARE_TOKEN:-}"
+CFG_CADDY_PORT="${CFG_CADDY_PORT:-$DEFAULT_PORT}"
+CFG_INSTALL_NETBIRD="${CFG_INSTALL_NETBIRD:-n}"
+CFG_NETBIRD_SETUP_KEY="${CFG_NETBIRD_SETUP_KEY:-}"
+CFG_INSTALL_MONITORING="${CFG_INSTALL_MONITORING:-n}"
+CFG_INSTANCE_NAME="${CFG_INSTANCE_NAME:-}"
+CFG_GRAFANA_IP="${CFG_GRAFANA_IP:-}"
+CFG_APPLY_NETWORK="${CFG_APPLY_NETWORK:-y}"
+
+# Отслеживание статуса установки для финального саммари
+STATUS_NETWORK="пропущен"
+STATUS_DOCKER="пропущен"
+STATUS_REMNANODE="пропущен"
+STATUS_CADDY="пропущен"
+STATUS_NETBIRD="пропущен"
+STATUS_MONITORING="пропущен"
+
+# Детали установки (заполняются по ходу)
+DETAIL_REMNANODE_PORT=""
+DETAIL_CADDY_DOMAIN=""
+DETAIL_CADDY_PORT=""
+DETAIL_NETBIRD_IP=""
+DETAIL_GRAFANA_IP=""
 
 # Получение IP сервера
 get_server_ip() {
@@ -69,6 +123,292 @@ log_warning() {
 
 log_error() {
     echo -e "${RED}❌ $*${NC}" >&2
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  Утилиты: спиннер, валидация, бэкап, проверки
+# ═══════════════════════════════════════════════════════════════════
+
+# Создание отслеживаемого temp файла (автоочистка при выходе)
+create_temp_file() {
+    local tmp
+    tmp=$(mktemp)
+    TEMP_FILES+=("$tmp")
+    echo "$tmp"
+}
+
+# Анимированный спиннер для длительных операций
+spinner() {
+    local pid=$1
+    local msg="${2:-Выполнение...}"
+    local -a frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
+    local i=0
+
+    # Без спиннера в non-interactive режиме
+    if [ "${NON_INTERACTIVE:-false}" = true ]; then
+        wait "$pid" 2>/dev/null
+        return $?
+    fi
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r  ${CYAN}%s${NC} %s" "${frames[$i]}" "$msg"
+        i=$(( (i + 1) % ${#frames[@]} ))
+        sleep 0.1
+    done
+    printf "\r\033[K"
+    wait "$pid" 2>/dev/null
+    return $?
+}
+
+# Скачивание файла со спиннером
+download_with_progress() {
+    local url="$1"
+    local output="$2"
+    local msg="${3:-Скачивание...}"
+
+    wget --timeout=30 --tries=3 "$url" -q -O "$output" &
+    local pid=$!
+    spinner "$pid" "$msg"
+    return $?
+}
+
+# Валидированный выбор из меню (с повторным запросом при ошибке)
+prompt_choice() {
+    local prompt="$1"
+    local max="$2"
+    local result_var="$3"
+    local default="${4:-}"
+
+    # Non-interactive: использовать default
+    if [ "${NON_INTERACTIVE:-false}" = true ]; then
+        eval "$result_var=\"${default:-1}\""
+        return 0
+    fi
+
+    while true; do
+        read -p "$prompt" -r _choice
+        # Если пустой ввод и есть default
+        if [ -z "$_choice" ] && [ -n "$default" ]; then
+            eval "$result_var=\"$default\""
+            return 0
+        fi
+        if [[ "$_choice" =~ ^[0-9]+$ ]] && [ "$_choice" -ge 1 ] && [ "$_choice" -le "$max" ]; then
+            eval "$result_var=\"$_choice\""
+            return 0
+        fi
+        log_warning "Неверный выбор. Введите число от 1 до $max."
+    done
+}
+
+# Запрос yes/no с валидацией
+prompt_yn() {
+    local prompt="$1"
+    local default="${2:-}"
+    local config_val="${3:-}"
+
+    # Non-interactive: использовать config значение или default
+    if [ "${NON_INTERACTIVE:-false}" = true ]; then
+        local val="${config_val:-$default}"
+        [[ "$val" =~ ^[Yy]$ ]] && return 0 || return 1
+    fi
+
+    while true; do
+        read -p "$prompt" -r _answer
+        _answer="${_answer:-$default}"
+        if [[ "$_answer" =~ ^[Yy]$ ]]; then
+            return 0
+        elif [[ "$_answer" =~ ^[Nn]$ ]]; then
+            return 1
+        fi
+        log_warning "Введите y или n."
+    done
+}
+
+# Проверка свободного места на диске
+check_disk_space() {
+    local required_mb="${1:-500}"
+    local target_dir="${2:-/opt}"
+
+    local available_mb
+    available_mb=$(df -m "$target_dir" 2>/dev/null | awk 'NR==2 {print $4}')
+
+    if [ -z "$available_mb" ]; then
+        log_warning "Не удалось определить свободное место на диске"
+        return 0
+    fi
+
+    if [ "$available_mb" -lt "$required_mb" ]; then
+        log_error "Недостаточно места на диске: ${available_mb} МБ доступно, требуется минимум ${required_mb} МБ"
+        return 1
+    fi
+
+    log_success "Свободное место на диске: ${available_mb} МБ"
+    return 0
+}
+
+# Бэкап существующей конфигурации перед перезаписью
+backup_existing_config() {
+    local dir="$1"
+    local backup_dir="${dir}.backup.$(date +%Y%m%d_%H%M%S)"
+
+    if [ -d "$dir" ]; then
+        local has_files=false
+        for f in "$dir"/.env "$dir"/docker-compose.yml "$dir"/Caddyfile; do
+            if [ -f "$f" ]; then
+                has_files=true
+                break
+            fi
+        done
+
+        if [ "$has_files" = true ]; then
+            mkdir -p "$backup_dir"
+            for f in "$dir"/.env "$dir"/docker-compose.yml "$dir"/Caddyfile; do
+                [ -f "$f" ] && cp "$f" "$backup_dir/" 2>/dev/null || true
+            done
+            log_info "Бэкап конфигурации: $backup_dir"
+        fi
+    fi
+}
+
+# Валидация Cloudflare API Token через API
+validate_cloudflare_token() {
+    local token="$1"
+
+    log_info "Проверка Cloudflare API Token..."
+
+    local response
+    response=$(curl -s --connect-timeout 10 --max-time 15 \
+        -H "Authorization: Bearer $token" \
+        "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null) || true
+
+    if echo "$response" | grep -q '"success":true'; then
+        log_success "Cloudflare API Token валиден"
+        return 0
+    else
+        local error_msg
+        error_msg=$(echo "$response" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -1)
+        log_error "Cloudflare API Token невалиден${error_msg:+: $error_msg}"
+        return 1
+    fi
+}
+
+# Получение последней версии с GitHub (с fallback)
+fetch_latest_version() {
+    local repo="$1"
+    local default="$2"
+
+    local version
+    version=$(curl -s --connect-timeout 5 --max-time 10 \
+        "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 | sed 's/^v//')
+
+    if [ -n "$version" ]; then
+        echo "$version"
+    else
+        echo "$default"
+    fi
+}
+
+# Проверка здоровья Docker контейнера с ожиданием
+check_container_health() {
+    local compose_dir="$1"
+    local service_name="$2"
+    local max_wait="${3:-30}"
+
+    local waited=0
+    while [ $waited -lt "$max_wait" ]; do
+        if docker compose -f "$compose_dir/docker-compose.yml" ps 2>/dev/null | grep -qE "Up|running"; then
+            return 0
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    return 1
+}
+
+# Загрузка конфиг-файла для non-interactive режима
+load_config_file() {
+    local config_file="${1:-$CONFIG_FILE}"
+
+    if [ -f "$config_file" ]; then
+        log_info "Загрузка конфигурации из $config_file"
+        # shellcheck source=/dev/null
+        source "$config_file"
+        NON_INTERACTIVE=true
+    fi
+}
+
+# Итоговое саммари установки
+show_installation_summary() {
+    echo
+    echo -e "${GRAY}$(printf '═%.0s' $(seq 1 56))${NC}"
+    echo -e "${WHITE}  📋 Итоги установки${NC}"
+    echo -e "${GRAY}$(printf '═%.0s' $(seq 1 56))${NC}"
+    echo
+
+    local -a components=("network:Сетевые настройки" "docker:Docker" "remnanode:RemnawaveNode" "caddy:Caddy Selfsteal" "netbird:Netbird VPN" "monitoring:Мониторинг Grafana")
+
+    for entry in "${components[@]}"; do
+        local key="${entry%%:*}"
+        local label="${entry#*:}"
+        local status
+
+        case "$key" in
+            network)     status="$STATUS_NETWORK" ;;
+            docker)      status="$STATUS_DOCKER" ;;
+            remnanode)   status="$STATUS_REMNANODE" ;;
+            caddy)       status="$STATUS_CADDY" ;;
+            netbird)     status="$STATUS_NETBIRD" ;;
+            monitoring)  status="$STATUS_MONITORING" ;;
+        esac
+
+        local icon status_colored
+        case "$status" in
+            "установлен"|"настроен"|"запущен"|"подключен"|"уже установлен"|"применены")
+                icon="✅"
+                status_colored="${GREEN}${status}${NC}"
+                ;;
+            "пропущен")
+                icon="⏭️ "
+                status_colored="${GRAY}${status}${NC}"
+                ;;
+            "ошибка"|"не запущен")
+                icon="❌"
+                status_colored="${RED}${status}${NC}"
+                ;;
+            *)
+                icon="⚠️ "
+                status_colored="${YELLOW}${status}${NC}"
+                ;;
+        esac
+
+        printf "  %s  %-24s %b\n" "$icon" "$label" "$status_colored"
+    done
+
+    # Детали
+    echo
+    if [ -n "$DETAIL_REMNANODE_PORT" ]; then
+        echo -e "${GRAY}  Node порт: $DETAIL_REMNANODE_PORT${NC}"
+    fi
+    if [ -n "$DETAIL_CADDY_DOMAIN" ]; then
+        echo -e "${GRAY}  Домен: $DETAIL_CADDY_DOMAIN${NC}"
+    fi
+    if [ -n "$DETAIL_CADDY_PORT" ]; then
+        echo -e "${GRAY}  HTTPS порт: $DETAIL_CADDY_PORT${NC}"
+    fi
+    if [ -n "$DETAIL_NETBIRD_IP" ]; then
+        echo -e "${GRAY}  Netbird IP: $DETAIL_NETBIRD_IP${NC}"
+    fi
+    if [ -n "$DETAIL_GRAFANA_IP" ]; then
+        echo -e "${GRAY}  Grafana: $DETAIL_GRAFANA_IP${NC}"
+    fi
+
+    echo
+    echo -e "${GRAY}$(printf '═%.0s' $(seq 1 56))${NC}"
+    echo -e "${GRAY}  Сервер: $NODE_IP${NC}"
+    echo -e "${GRAY}  Лог: $INSTALL_LOG${NC}"
+    echo -e "${GRAY}$(printf '═%.0s' $(seq 1 56))${NC}"
+    echo
 }
 
 # Проверка root
@@ -117,7 +457,8 @@ detect_package_manager() {
 # Установка пакета
 install_package() {
     local package=$1
-    local install_log=$(mktemp)
+    local install_log
+    install_log=$(create_temp_file)
     local install_success=false
     
     # Для Ubuntu/Debian проверяем блокировку перед установкой
@@ -147,7 +488,7 @@ install_package() {
                 if wait_for_dpkg_lock; then
                     log_info "Повторная попытка установки $package..."
                     rm -f "$install_log"
-                    install_log=$(mktemp)
+                    install_log=$(create_temp_file)
                     if $PKG_MANAGER install -y -qq "$package" >>"$install_log" 2>&1; then
                         install_success=true
                     fi
@@ -377,9 +718,10 @@ install_docker() {
         systemctl enable docker
     else
         # Устанавливаем Docker с выводом ошибок
-        local docker_install_log=$(mktemp)
+        local docker_install_log
+        docker_install_log=$(create_temp_file)
         local install_success=false
-        
+
         # Пробуем установить Docker
         if curl -fsSL https://get.docker.com 2>/dev/null | sh >"$docker_install_log" 2>&1; then
             install_success=true
@@ -390,7 +732,7 @@ install_docker() {
                 if wait_for_dpkg_lock; then
                     log_info "Повторная попытка установки Docker..."
                     rm -f "$docker_install_log"
-                    docker_install_log=$(mktemp)
+                    docker_install_log=$(create_temp_file)
                     if curl -fsSL https://get.docker.com 2>/dev/null | sh >"$docker_install_log" 2>&1; then
                         install_success=true
                     fi
@@ -474,9 +816,12 @@ install_remnanode() {
         echo -e "   ${WHITE}1)${NC} ${GRAY}Пропустить установку${NC}"
         echo -e "   ${WHITE}2)${NC} ${YELLOW}Перезаписать (удалить существующую установку)${NC}"
         echo
-        read -p "Выберите опцию [1-2]: " remnanode_choice
-        
+
+        local remnanode_choice
+        prompt_choice "Выберите опцию [1-2]: " 2 remnanode_choice
+
         if [ "$remnanode_choice" = "2" ]; then
+            backup_existing_config "$REMNANODE_DIR"
             log_warning "Удаление существующей установки RemnawaveNode..."
             if [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
                 docker compose -f "$REMNANODE_DIR/docker-compose.yml" down 2>/dev/null || true
@@ -485,28 +830,39 @@ install_remnanode() {
             log_success "Существующая установка удалена"
             echo
         else
+            STATUS_REMNANODE="уже установлен"
             log_info "Установка RemnawaveNode пропущена"
             return 0
         fi
     fi
-    
+
     log_info "Установка Remnawave Node..."
-    
+
     # Создание директорий
     mkdir -p "$REMNANODE_DIR"
     mkdir -p "$REMNANODE_DATA_DIR"
-    
+
     # Запрос SECRET_KEY
-    echo
-    echo -e "${CYAN}📝 Введите SECRET_KEY из Remnawave-Panel${NC}"
-    echo -e "${GRAY}   Вставьте содержимое и нажмите ENTER на новой строке для завершения:${NC}"
-    SECRET_KEY_VALUE=""
-    while IFS= read -r line; do
-        if [[ -z $line ]]; then
-            break
-        fi
-        SECRET_KEY_VALUE="$SECRET_KEY_VALUE$line"
-    done
+    if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_SECRET_KEY" ]; then
+        SECRET_KEY_VALUE="$CFG_SECRET_KEY"
+    else
+        echo
+        echo -e "${CYAN}📝 Введите SECRET_KEY из Remnawave-Panel${NC}"
+        echo -e "${GRAY}   Вставьте содержимое и нажмите ENTER на новой строке для завершения${NC}"
+        echo -e "${GRAY}   (или введите 'cancel' для отмены):${NC}"
+        SECRET_KEY_VALUE=""
+        while IFS= read -r line; do
+            if [[ -z $line ]]; then
+                break
+            fi
+            if [[ "$line" == "cancel" ]]; then
+                log_info "Установка RemnawaveNode отменена"
+                STATUS_REMNANODE="пропущен"
+                return 0
+            fi
+            SECRET_KEY_VALUE="$SECRET_KEY_VALUE$line"
+        done
+    fi
 
     if [ -z "$SECRET_KEY_VALUE" ]; then
         log_error "SECRET_KEY не может быть пустым!"
@@ -514,32 +870,35 @@ install_remnanode() {
     fi
 
     # Запрос порта
-    echo
-    read -p "Введите NODE_PORT (по умолчанию 3000): " -r NODE_PORT
-    NODE_PORT=${NODE_PORT:-3000}
-    
+    if [ "${NON_INTERACTIVE:-false}" = true ]; then
+        NODE_PORT="$CFG_NODE_PORT"
+    else
+        echo
+        read -p "Введите NODE_PORT (по умолчанию 3000): " -r NODE_PORT
+        NODE_PORT=${NODE_PORT:-3000}
+    fi
+
     # Валидация порта
     if ! [[ "$NODE_PORT" =~ ^[0-9]+$ ]] || [ "$NODE_PORT" -lt 1 ] || [ "$NODE_PORT" -gt 65535 ]; then
         log_error "Неверный номер порта"
         exit 1
     fi
-    
+    DETAIL_REMNANODE_PORT="$NODE_PORT"
+
     # Запрос установки Xray-core
-    echo
-    read -p "Установить последнюю версию Xray-core? (y/n): " -r install_xray
     INSTALL_XRAY=false
-    if [[ "$install_xray" =~ ^[Yy]$ ]]; then
+    if prompt_yn "Установить последнюю версию Xray-core? (y/n): " "y" "$CFG_INSTALL_XRAY"; then
         INSTALL_XRAY=true
         if ! install_xray_core; then
             log_error "Не удалось установить Xray-core"
             echo
-            read -p "Продолжить установку RemnawaveNode без Xray-core? (y/n): " -r continue_without_xray
-            if [[ ! $continue_without_xray =~ ^[Yy]$ ]]; then
+            if prompt_yn "Продолжить установку RemnawaveNode без Xray-core? (y/n): " "y"; then
+                INSTALL_XRAY=false
+                log_warning "Продолжаем установку без Xray-core"
+            else
                 log_error "Установка прервана"
                 exit 1
             fi
-            INSTALL_XRAY=false
-            log_warning "Продолжаем установку без Xray-core"
         fi
     fi
     
@@ -599,13 +958,15 @@ EOF
     cd "$REMNANODE_DIR"
     docker compose up -d
 
-    # Проверка что контейнер поднялся
-    sleep 3
-    if docker compose ps 2>/dev/null | grep -qE "Up|running"; then
+    # Проверка что контейнер поднялся (с ожиданием до 30 сек)
+    log_info "Ожидание запуска контейнера..."
+    if check_container_health "$REMNANODE_DIR" "remnanode" 30; then
         log_success "RemnawaveNode запущен"
+        STATUS_REMNANODE="установлен"
     else
         log_warning "RemnawaveNode может не запуститься корректно. Проверьте логи:"
         log_warning "   cd $REMNANODE_DIR && docker compose logs"
+        STATUS_REMNANODE="ошибка"
     fi
 }
 
@@ -685,8 +1046,8 @@ install_xray_core() {
     log_info "Скачивание Xray-core версии ${latest_release}..."
     log_info "URL: $xray_download_url"
     
-    # Скачиваем файл в директорию данных
-    if ! wget --timeout=30 --tries=3 "${xray_download_url}" -q -O "${REMNANODE_DATA_DIR}/${xray_filename}"; then
+    # Скачиваем файл в директорию данных (со спиннером)
+    if ! download_with_progress "${xray_download_url}" "${REMNANODE_DATA_DIR}/${xray_filename}" "Скачивание Xray-core ${latest_release}..."; then
         log_error "Не удалось скачать Xray-core"
         log_error "Проверьте интернет-соединение и доступность GitHub"
         return 1
@@ -957,9 +1318,12 @@ install_caddy_selfsteal() {
         echo -e "   ${WHITE}1)${NC} ${GRAY}Пропустить установку${NC}"
         echo -e "   ${WHITE}2)${NC} ${YELLOW}Перезаписать (удалить существующую установку)${NC}"
         echo
-        read -p "Выберите опцию [1-2]: " caddy_choice
-        
+
+        local caddy_choice
+        prompt_choice "Выберите опцию [1-2]: " 2 caddy_choice
+
         if [ "$caddy_choice" = "2" ]; then
+            backup_existing_config "$CADDY_DIR"
             log_warning "Удаление существующей установки Caddy..."
             if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
                 docker compose -f "$CADDY_DIR/docker-compose.yml" down 2>/dev/null || true
@@ -968,6 +1332,7 @@ install_caddy_selfsteal() {
             log_success "Существующая установка удалена"
             echo
         else
+            STATUS_CADDY="уже установлен"
             log_info "Установка Caddy Selfsteal пропущена"
             return 0
         fi
@@ -981,25 +1346,32 @@ install_caddy_selfsteal() {
     mkdir -p "$CADDY_DIR/logs"
     
     # Запрос домена
-    echo
-    echo -e "${CYAN}🌐 Конфигурация домена${NC}"
-    echo -e "${GRAY}   Домен должен совпадать с realitySettings.serverNames в Xray Reality${NC}"
-    echo
     local original_domain=""
-    while [ -z "$original_domain" ]; do
-        read -p "Введите домен (например, reality.example.com): " original_domain
-        if [ -z "$original_domain" ]; then
-            log_error "Домен не может быть пустым!"
-        fi
-    done
-    
+    if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_DOMAIN" ]; then
+        original_domain="$CFG_DOMAIN"
+    else
+        echo
+        echo -e "${CYAN}🌐 Конфигурация домена${NC}"
+        echo -e "${GRAY}   Домен должен совпадать с realitySettings.serverNames в Xray Reality${NC}"
+        echo
+        while [ -z "$original_domain" ]; do
+            read -p "Введите домен (например, reality.example.com): " original_domain
+            if [ -z "$original_domain" ]; then
+                log_error "Домен не может быть пустым!"
+            fi
+        done
+    fi
+    DETAIL_CADDY_DOMAIN="$original_domain"
+
     # Выбор типа сертификата
     echo
     echo -e "${WHITE}🔐 Тип SSL сертификата:${NC}"
     echo -e "   ${WHITE}1)${NC} ${GRAY}Обычный сертификат (HTTP-01 challenge)${NC}"
     echo -e "   ${WHITE}2)${NC} ${GRAY}Wildcard сертификат (DNS-01 challenge через Cloudflare)${NC}"
     echo
-    read -p "Выберите опцию [1-2]: " cert_choice
+
+    local cert_choice
+    prompt_choice "Выберите опцию [1-2]: " 2 cert_choice "$CFG_CERT_TYPE"
     
     local domain="$original_domain"
     local root_domain=""
@@ -1016,13 +1388,28 @@ install_caddy_selfsteal() {
         echo -e "${GRAY}   3. Выберите зону для которой нужен сертификат${NC}"
         echo
         
-        while [ -z "$CLOUDFLARE_API_TOKEN" ]; do
-            read -s -p "Введите Cloudflare API Token: " -r CLOUDFLARE_API_TOKEN
-            echo
-            if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
-                log_error "API Token не может быть пустым!"
+        if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_CLOUDFLARE_TOKEN" ]; then
+            CLOUDFLARE_API_TOKEN="$CFG_CLOUDFLARE_TOKEN"
+        else
+            while [ -z "$CLOUDFLARE_API_TOKEN" ]; do
+                read -s -p "Введите Cloudflare API Token: " -r CLOUDFLARE_API_TOKEN
+                echo
+                if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+                    log_error "API Token не может быть пустым!"
+                fi
+            done
+        fi
+
+        # Валидация токена через Cloudflare API
+        if ! validate_cloudflare_token "$CLOUDFLARE_API_TOKEN"; then
+            if prompt_yn "Токен невалиден. Продолжить всё равно? (y/n): " "n"; then
+                log_warning "Продолжаем с невалидным токеном"
+            else
+                log_error "Установка Caddy отменена"
+                STATUS_CADDY="ошибка"
+                return 1
             fi
-        done
+        fi
         
         # Преобразование домена в wildcard формат
         root_domain=$(echo "$original_domain" | sed 's/^[^.]*\.//')
@@ -1063,7 +1450,9 @@ install_caddy_selfsteal() {
         echo -e "   ${WHITE}1)${NC} ${GRAY}Использовать существующий сертификат${NC}"
         echo -e "   ${WHITE}2)${NC} ${GRAY}Получить новый сертификат${NC}"
         echo
-        read -p "Выберите опцию [1-2]: " cert_action
+
+        local cert_action
+        prompt_choice "Выберите опцию [1-2]: " 2 cert_action
         
         if [ "$cert_action" = "1" ]; then
             log_info "Будет использован существующий сертификат"
@@ -1085,8 +1474,10 @@ install_caddy_selfsteal() {
     echo -e "   ${WHITE}1)${NC} ${GRAY}Проверить DNS (рекомендуется)${NC}"
     echo -e "   ${WHITE}2)${NC} ${GRAY}Пропустить проверку${NC}"
     echo
-    read -p "Выберите опцию [1-2]: " dns_choice
-    
+
+    local dns_choice
+    prompt_choice "Выберите опцию [1-2]: " 2 dns_choice
+
     if [ "$dns_choice" = "1" ]; then
         # Проверяем оригинальный домен, не wildcard
         if ! validate_domain_dns "$original_domain" "$NODE_IP"; then
@@ -1099,8 +1490,13 @@ install_caddy_selfsteal() {
     fi
     
     # Запрос порта
-    echo
-    read -p "Введите HTTPS порт (по умолчанию $DEFAULT_PORT): " input_port
+    local input_port
+    if [ "${NON_INTERACTIVE:-false}" = true ]; then
+        input_port="$CFG_CADDY_PORT"
+    else
+        echo
+        read -p "Введите HTTPS порт (по умолчанию $DEFAULT_PORT): " input_port
+    fi
     local port="${input_port:-$DEFAULT_PORT}"
     
     # Валидация порта
@@ -1108,7 +1504,8 @@ install_caddy_selfsteal() {
         log_error "Неверный номер порта"
         exit 1
     fi
-    
+    DETAIL_CADDY_PORT="$port"
+
     # Создание .env файла
     cat > "$CADDY_DIR/.env" << EOF
 # Caddy for Reality Selfsteal Configuration
@@ -1313,9 +1710,9 @@ EOF
     fi
     if [ "$port_conflict" = true ]; then
         echo
-        read -p "Порты заняты. Продолжить запуск Caddy? (y/n): " -r force_start
-        if [[ ! $force_start =~ ^[Yy]$ ]]; then
+        if ! prompt_yn "Порты заняты. Продолжить запуск Caddy? (y/n): " "n"; then
             log_warning "Запуск Caddy отложен. Запустите вручную: cd $CADDY_DIR && docker compose up -d"
+            STATUS_CADDY="отложен"
             return 0
         fi
     fi
@@ -1325,13 +1722,15 @@ EOF
     cd "$CADDY_DIR"
     docker compose up -d
 
-    # Проверка что контейнер поднялся
-    sleep 3
-    if docker compose ps 2>/dev/null | grep -qE "Up|running"; then
+    # Проверка что контейнер поднялся (с ожиданием до 30 сек)
+    log_info "Ожидание запуска контейнера..."
+    if check_container_health "$CADDY_DIR" "caddy-selfsteal" 30; then
         log_success "Caddy запущен"
+        STATUS_CADDY="установлен"
     else
         log_warning "Caddy может не запуститься корректно. Проверьте логи:"
         log_warning "   cd $CADDY_DIR && docker compose logs"
+        STATUS_CADDY="ошибка"
     fi
 
     # Вывод итоговой информации
@@ -1389,29 +1788,32 @@ install_netbird() {
     echo -e "${WHITE}🌐 Установка Netbird VPN${NC}"
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
     echo
-    
-    read -p "Установить Netbird VPN? (y/n): " -r install_netbird_choice
-    if [[ ! $install_netbird_choice =~ ^[Yy]$ ]]; then
+
+    if ! prompt_yn "Установить Netbird VPN? (y/n): " "n" "$CFG_INSTALL_NETBIRD"; then
         log_info "Установка Netbird пропущена"
         return 0
     fi
-    
+
     # Проверка, установлен ли уже Netbird
     if check_existing_netbird; then
         echo
         echo -e "${YELLOW}⚠️  Netbird уже установлен${NC}"
-        local current_status=$(netbird status 2>/dev/null | head -1 || echo "unknown")
-        log_info "Текущий статус: $current_status"
+        echo
+        log_info "Текущий статус:"
+        netbird status 2>/dev/null || echo "  unknown"
         echo
         echo -e "${WHITE}Выберите действие:${NC}"
         echo -e "   ${WHITE}1)${NC} ${GRAY}Пропустить установку${NC}"
         echo -e "   ${WHITE}2)${NC} ${GRAY}Переподключить Netbird${NC}"
         echo -e "   ${WHITE}3)${NC} ${YELLOW}Переустановить Netbird${NC}"
         echo
-        read -p "Выберите опцию [1-3]: " netbird_choice
-        
+
+        local netbird_choice
+        prompt_choice "Выберите опцию [1-3]: " 3 netbird_choice
+
         case "$netbird_choice" in
             1)
+                STATUS_NETBIRD="уже установлен"
                 log_info "Установка Netbird пропущена"
                 return 0
                 ;;
@@ -1436,17 +1838,14 @@ install_netbird() {
                 log_success "Существующая установка удалена"
                 echo
                 ;;
-            *)
-                log_info "Установка Netbird пропущена"
-                return 0
-                ;;
         esac
     fi
     
     log_info "Установка Netbird..."
     
     # Установка через официальный скрипт
-    local install_log=$(mktemp)
+    local install_log
+    install_log=$(create_temp_file)
     if curl -fsSL https://pkgs.netbird.io/install.sh 2>/dev/null | sh >"$install_log" 2>&1; then
         rm -f "$install_log"
         log_success "Netbird установлен"
@@ -1478,38 +1877,52 @@ connect_netbird() {
     echo -e "${CYAN}🔑 Подключение к Netbird${NC}"
     echo -e "${GRAY}   Для подключения нужен Setup Key из Netbird Dashboard${NC}"
     echo -e "${GRAY}   Получить ключ: https://app.netbird.io/ (или ваш self-hosted сервер)${NC}"
+    echo -e "${GRAY}   Введите 'cancel' для отмены${NC}"
     echo
-    
+
     local setup_key=""
-    while [ -z "$setup_key" ]; do
-        read -s -p "Введите Netbird Setup Key: " -r setup_key
-        echo
-        if [ -z "$setup_key" ]; then
-            log_error "Setup Key не может быть пустым!"
-        fi
-    done
+    if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_NETBIRD_SETUP_KEY" ]; then
+        setup_key="$CFG_NETBIRD_SETUP_KEY"
+    else
+        while [ -z "$setup_key" ]; do
+            read -s -p "Введите Netbird Setup Key: " -r setup_key
+            echo
+            if [ "$setup_key" = "cancel" ]; then
+                log_info "Подключение к Netbird отменено"
+                STATUS_NETBIRD="пропущен"
+                return 0
+            fi
+            if [ -z "$setup_key" ]; then
+                log_error "Setup Key не может быть пустым!"
+            fi
+        done
+    fi
 
     log_info "Подключение к Netbird..."
 
     # Подключение
     if netbird up --setup-key "$setup_key" 2>&1; then
         log_success "Подключение к Netbird выполнено"
-        
+
         # Проверка статуса
         sleep 2
         echo
         log_info "Статус Netbird:"
         netbird status 2>/dev/null || true
-        
+
         # Показать IP адрес
-        local netbird_ip=$(ip addr show wt0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 || echo "не определен")
-        if [ -n "$netbird_ip" ] && [ "$netbird_ip" != "не определен" ]; then
+        local netbird_ip
+        netbird_ip=$(ip addr show wt0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1 || echo "")
+        if [ -n "$netbird_ip" ]; then
             echo
             log_success "Netbird IP адрес: $netbird_ip"
+            DETAIL_NETBIRD_IP="$netbird_ip"
         fi
+        STATUS_NETBIRD="подключен"
     else
         log_error "Не удалось подключиться к Netbird"
         log_error "Проверьте правильность Setup Key и доступность сервера"
+        STATUS_NETBIRD="ошибка"
         return 1
     fi
 }
@@ -1529,12 +1942,11 @@ install_grafana_monitoring() {
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
     echo
     
-    read -p "Установить мониторинг Grafana (cadvisor, node_exporter, vmagent)? (y/n): " -r install_monitoring_choice
-    if [[ ! $install_monitoring_choice =~ ^[Yy]$ ]]; then
+    if ! prompt_yn "Установить мониторинг Grafana (cadvisor, node_exporter, vmagent)? (y/n): " "n" "$CFG_INSTALL_MONITORING"; then
         log_info "Установка мониторинга пропущена"
         return 0
     fi
-    
+
     # Проверка существующей установки
     if check_existing_monitoring; then
         echo
@@ -1545,9 +1957,12 @@ install_grafana_monitoring() {
         echo -e "   ${WHITE}1)${NC} ${GRAY}Пропустить установку${NC}"
         echo -e "   ${WHITE}2)${NC} ${YELLOW}Переустановить (удалить существующую установку)${NC}"
         echo
-        read -p "Выберите опцию [1-2]: " monitoring_choice
-        
+
+        local monitoring_choice
+        prompt_choice "Выберите опцию [1-2]: " 2 monitoring_choice
+
         if [ "$monitoring_choice" = "1" ]; then
+            STATUS_MONITORING="уже установлен"
             log_info "Установка мониторинга пропущена"
             return 0
         else
@@ -1592,7 +2007,7 @@ install_grafana_monitoring() {
     log_info "Установка cAdvisor ${CADVISOR_VERSION}..."
     local cadvisor_url="https://github.com/google/cadvisor/releases/download/${CADVISOR_VERSION}/cadvisor-${CADVISOR_VERSION}-linux-${ARCH}"
 
-    if ! wget --timeout=30 --tries=3 "$cadvisor_url" -q -O /opt/monitoring/cadvisor/cadvisor; then
+    if ! download_with_progress "$cadvisor_url" "/opt/monitoring/cadvisor/cadvisor" "Скачивание cAdvisor ${CADVISOR_VERSION}..."; then
         log_error "Не удалось скачать cAdvisor"
         return 1
     fi
@@ -1604,7 +2019,7 @@ install_grafana_monitoring() {
     local ne_dir="/opt/monitoring/nodeexporter"
     local node_exporter_url="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}.tar.gz"
 
-    if ! wget --timeout=30 --tries=3 "$node_exporter_url" -q -O "${ne_dir}/node_exporter.tar.gz"; then
+    if ! download_with_progress "$node_exporter_url" "${ne_dir}/node_exporter.tar.gz" "Скачивание Node Exporter ${NODE_EXPORTER_VERSION}..."; then
         log_error "Не удалось скачать Node Exporter"
         return 1
     fi
@@ -1620,7 +2035,7 @@ install_grafana_monitoring() {
     local vm_dir="/opt/monitoring/vmagent"
     local vmagent_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/${VMAGENT_VERSION}/vmutils-linux-${ARCH}-${VMAGENT_VERSION}.tar.gz"
 
-    if ! wget --timeout=30 --tries=3 "$vmagent_url" -q -O "${vm_dir}/vmagent.tar.gz"; then
+    if ! download_with_progress "$vmagent_url" "${vm_dir}/vmagent.tar.gz" "Скачивание VictoriaMetrics Agent ${VMAGENT_VERSION}..."; then
         log_error "Не удалось скачать VictoriaMetrics Agent"
         return 1
     fi
@@ -1632,9 +2047,14 @@ install_grafana_monitoring() {
     log_success "VictoriaMetrics Agent установлен"
     
     # Запрос имени инстанса
-    echo
-    read -p "Введите название инстанса (имя сервера для Grafana): " -r instance_name
-    instance_name=${instance_name:-$(hostname)}
+    local instance_name
+    if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_INSTANCE_NAME" ]; then
+        instance_name="$CFG_INSTANCE_NAME"
+    else
+        echo
+        read -p "Введите название инстанса (имя сервера для Grafana): " -r instance_name
+        instance_name=${instance_name:-$(hostname)}
+    fi
     log_info "Используется имя инстанса: $instance_name"
     
     # Запрос IP адреса сервера Grafana (Netbird IP)
@@ -1644,15 +2064,20 @@ install_grafana_monitoring() {
     echo -e "${GRAY}   Можно узнать командой: netbird status${NC}"
     echo
     local grafana_ip=""
-    while [ -z "$grafana_ip" ]; do
-        read -p "Введите Netbird IP адрес сервера Grafana (например, 100.64.0.1): " -r grafana_ip
-        if [ -z "$grafana_ip" ]; then
-            log_error "IP адрес не может быть пустым!"
-        elif ! [[ "$grafana_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            log_error "Неверный формат IP адреса!"
-            grafana_ip=""
-        fi
-    done
+    if [ "${NON_INTERACTIVE:-false}" = true ] && [ -n "$CFG_GRAFANA_IP" ]; then
+        grafana_ip="$CFG_GRAFANA_IP"
+    else
+        while [ -z "$grafana_ip" ]; do
+            read -p "Введите Netbird IP адрес сервера Grafana (например, 100.64.0.1): " -r grafana_ip
+            if [ -z "$grafana_ip" ]; then
+                log_error "IP адрес не может быть пустым!"
+            elif ! [[ "$grafana_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                log_error "Неверный формат IP адреса!"
+                grafana_ip=""
+            fi
+        done
+    fi
+    DETAIL_GRAFANA_IP="$grafana_ip"
     
     # Создание конфигурации vmagent
     log_info "Создание конфигурации vmagent..."
@@ -1785,6 +2210,7 @@ EOF
     
     echo
     log_success "Мониторинг Grafana установлен и настроен"
+    STATUS_MONITORING="установлен"
     echo
     echo -e "${WHITE}📋 Информация о мониторинге:${NC}"
     echo -e "${GRAY}   Имя инстанса: $instance_name${NC}"
@@ -1802,8 +2228,7 @@ apply_network_settings() {
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
     echo
 
-    read -p "Применить оптимизацию сетевых настроек (BBR, TCP tuning, лимиты)? (y/n): " -r apply_network_choice
-    if [[ ! $apply_network_choice =~ ^[Yy]$ ]]; then
+    if ! prompt_yn "Применить оптимизацию сетевых настроек (BBR, TCP tuning, лимиты)? (y/n): " "y" "$CFG_APPLY_NETWORK"; then
         log_info "Оптимизация сетевых настроек пропущена"
         return 0
     fi
@@ -1823,7 +2248,9 @@ apply_network_settings() {
         echo -e "   ${WHITE}1)${NC} ${GRAY}Пропустить (оставить текущие настройки)${NC}"
         echo -e "   ${WHITE}2)${NC} ${YELLOW}Перезаписать настройки${NC}"
         echo
-        read -p "Выберите опцию [1-2]: " sysctl_choice
+
+        local sysctl_choice
+        prompt_choice "Выберите опцию [1-2]: " 2 sysctl_choice
 
         if [ "$sysctl_choice" = "1" ]; then
             log_info "Сетевые настройки не изменены"
@@ -1963,6 +2390,7 @@ EOF
     echo
 
     log_success "Оптимизация сетевых настроек завершена"
+    STATUS_NETWORK="применены"
     echo -e "${CYAN}   Для полного применения лимитов рекомендуется перезагрузка системы${NC}"
 }
 
@@ -1972,25 +2400,61 @@ main() {
     echo -e "${WHITE}🚀 Установка RemnawaveNode + Caddy Selfsteal${NC}"
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
     echo
-    
+
     # Проверка root
     check_root
 
-    # Получение IP сервера (после check_root, чтобы не тратить время на curl если не root)
+    # Загрузка конфиг-файла для non-interactive режима
+    if [ -f "$CONFIG_FILE" ]; then
+        load_config_file "$CONFIG_FILE"
+    fi
+
+    # Получение IP сервера (после check_root)
     NODE_IP=$(get_server_ip)
 
     # Определение ОС
     detect_os
     detect_package_manager
-    
+
     log_info "Обнаружена ОС: $OS"
+    log_info "IP сервера: $NODE_IP"
+    echo
+
+    # Проверка свободного места на диске
+    if ! check_disk_space 500 "/opt"; then
+        if ! prompt_yn "Недостаточно места. Продолжить? (y/n): " "n"; then
+            exit 1
+        fi
+    fi
     echo
 
     # Проактивная очистка блокировок пакетного менеджера (apt lock, unattended-upgrades)
     ensure_package_manager_available
     # Гарантируем восстановление автообновлений даже при падении скрипта
-    trap 'restore_auto_updates' EXIT
+    trap 'cleanup_temp_files; restore_auto_updates' EXIT
 
+    echo
+
+    # Автоопределение последних версий компонентов
+    log_info "Проверка актуальных версий компонентов..."
+    local new_cadvisor new_node_exporter new_vmagent
+    new_cadvisor=$(fetch_latest_version "google/cadvisor" "${CADVISOR_VERSION#v}")
+    new_node_exporter=$(fetch_latest_version "prometheus/node_exporter" "$NODE_EXPORTER_VERSION")
+    new_vmagent=$(fetch_latest_version "VictoriaMetrics/VictoriaMetrics" "${VMAGENT_VERSION#v}")
+
+    # Обновляем версии если получены более новые
+    if [ -n "$new_cadvisor" ] && [ "$new_cadvisor" != "${CADVISOR_VERSION#v}" ]; then
+        CADVISOR_VERSION="v$new_cadvisor"
+        log_info "cAdvisor: $CADVISOR_VERSION (обновлено)"
+    fi
+    if [ -n "$new_node_exporter" ] && [ "$new_node_exporter" != "$NODE_EXPORTER_VERSION" ]; then
+        NODE_EXPORTER_VERSION="$new_node_exporter"
+        log_info "Node Exporter: $NODE_EXPORTER_VERSION (обновлено)"
+    fi
+    if [ -n "$new_vmagent" ] && [ "$new_vmagent" != "${VMAGENT_VERSION#v}" ]; then
+        VMAGENT_VERSION="v$new_vmagent"
+        log_info "VM Agent: $VMAGENT_VERSION (обновлено)"
+    fi
     echo
 
     # Применение сетевых настроек (BBR, TCP tuning, лимиты)
@@ -2037,62 +2501,85 @@ main() {
         log_success "btop уже установлен"
     fi
     echo
-    
+
     # Установка Docker
     if ! install_docker; then
         log_error "Не удалось установить или запустить Docker"
+        STATUS_DOCKER="ошибка"
         exit 1
     fi
-    
+    STATUS_DOCKER="установлен"
+
     # Проверка Docker Compose
     check_docker_compose
-    
+
     echo
-    
+
     # Установка RemnawaveNode
     install_remnanode
-    
+
     echo
-    
+
     # Установка Caddy Selfsteal
     install_caddy_selfsteal
-    
+
     echo
-    
+
     # Установка Netbird
     install_netbird
-    
+
     echo
-    
+
     # Установка мониторинга Grafana
     install_grafana_monitoring
-    
+
     echo
 
     # Восстановление автоматических обновлений
     restore_auto_updates
+
+    # Итоговое саммари
+    show_installation_summary
 
     log_success "Всё готово! Установка завершена."
 }
 
 # Вывод справки
 show_help() {
-    echo "Использование: $(basename "$0") [ОПЦИЯ]"
     echo
-    echo "Автоматическая установка RemnawaveNode + Caddy Selfsteal + Netbird + Grafana мониторинг"
+    echo -e "${WHITE}🚀 Remnawave Node Installer${NC}"
+    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
     echo
-    echo "Опции:"
-    echo "  --help        Показать эту справку"
-    echo "  --uninstall   Удалить все компоненты"
-    echo "  (без опций)   Запустить установку"
+    echo -e "${WHITE}Использование:${NC} $(basename "$0") ${CYAN}[ОПЦИЯ]${NC}"
     echo
-    echo "Компоненты:"
-    echo "  - RemnawaveNode (Docker)     → $REMNANODE_DIR"
-    echo "  - Caddy Selfsteal (Docker)   → $CADDY_DIR"
-    echo "  - Netbird VPN"
-    echo "  - Grafana мониторинг         → /opt/monitoring"
+    echo -e "${WHITE}Опции:${NC}"
+    echo -e "  ${CYAN}--help${NC}          Показать эту справку"
+    echo -e "  ${CYAN}--uninstall${NC}     Удалить все компоненты"
+    echo -e "  ${CYAN}--config FILE${NC}   Использовать конфиг-файл (non-interactive режим)"
+    echo -e "  ${GRAY}(без опций)${NC}     Запустить интерактивную установку"
     echo
-    echo "Лог установки: $INSTALL_LOG"
+    echo -e "${WHITE}Компоненты:${NC}"
+    echo -e "  ${GREEN}●${NC} RemnawaveNode (Docker)     → ${GRAY}$REMNANODE_DIR${NC}"
+    echo -e "  ${GREEN}●${NC} Caddy Selfsteal (Docker)   → ${GRAY}$CADDY_DIR${NC}"
+    echo -e "  ${GREEN}●${NC} Netbird VPN"
+    echo -e "  ${GREEN}●${NC} Grafana мониторинг         → ${GRAY}/opt/monitoring${NC}"
+    echo
+    echo -e "${WHITE}Non-interactive режим:${NC}"
+    echo -e "  ${GRAY}Создайте файл /etc/remnanode-install.conf:${NC}"
+    echo -e "  ${CYAN}CFG_SECRET_KEY${NC}=\"...\"         ${GRAY}# SECRET_KEY из панели${NC}"
+    echo -e "  ${CYAN}CFG_DOMAIN${NC}=\"reality.example.com\" ${GRAY}# Домен${NC}"
+    echo -e "  ${CYAN}CFG_NODE_PORT${NC}=3000           ${GRAY}# Порт ноды${NC}"
+    echo -e "  ${CYAN}CFG_CERT_TYPE${NC}=1              ${GRAY}# 1=обычный, 2=wildcard${NC}"
+    echo -e "  ${CYAN}CFG_CADDY_PORT${NC}=9443          ${GRAY}# HTTPS порт Caddy${NC}"
+    echo -e "  ${CYAN}CFG_INSTALL_NETBIRD${NC}=n         ${GRAY}# Установка Netbird (y/n)${NC}"
+    echo -e "  ${CYAN}CFG_INSTALL_MONITORING${NC}=n      ${GRAY}# Установка мониторинга (y/n)${NC}"
+    echo
+    echo -e "${WHITE}Env переменные:${NC}"
+    echo -e "  ${CYAN}NON_INTERACTIVE=true${NC} ${GRAY}# Включить non-interactive режим${NC}"
+    echo -e "  ${CYAN}CONFIG_FILE=/path${NC}   ${GRAY}# Путь к конфиг-файлу${NC}"
+    echo
+    echo -e "${GRAY}Лог установки: $INSTALL_LOG${NC}"
+    echo
 }
 
 # Удаление всех компонентов
@@ -2154,7 +2641,34 @@ uninstall_all() {
     rm -rf /opt/monitoring
 
     echo
-    log_success "Все компоненты удалены"
+
+    # Верификация удаления
+    log_info "Проверка удаления..."
+    local all_clean=true
+
+    if [ -d "$REMNANODE_DIR" ]; then
+        log_warning "Директория $REMNANODE_DIR всё ещё существует"
+        all_clean=false
+    fi
+    if [ -d "$CADDY_DIR" ]; then
+        log_warning "Директория $CADDY_DIR всё ещё существует"
+        all_clean=false
+    fi
+    if [ -d "/opt/monitoring" ]; then
+        log_warning "Директория /opt/monitoring всё ещё существует"
+        all_clean=false
+    fi
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qE "^(remnanode|caddy)"; then
+        log_warning "Обнаружены оставшиеся Docker контейнеры"
+        all_clean=false
+    fi
+
+    if [ "$all_clean" = true ]; then
+        log_success "Все компоненты успешно удалены"
+    else
+        log_warning "Некоторые компоненты могли быть удалены не полностью"
+    fi
+
     echo -e "${GRAY}Для удаления Docker volumes: docker volume rm caddy_data caddy_config${NC}"
     echo -e "${GRAY}Для удаления Netbird: apt remove netbird (или yum remove netbird)${NC}"
 }
@@ -2169,12 +2683,22 @@ case "${1:-}" in
         uninstall_all
         exit 0
         ;;
+    --config)
+        if [ -n "${2:-}" ] && [ -f "$2" ]; then
+            CONFIG_FILE="$2"
+            NON_INTERACTIVE=true
+        else
+            echo -e "${RED}❌ Укажите путь к конфиг-файлу: $0 --config /path/to/config${NC}"
+            exit 1
+        fi
+        main
+        ;;
     "")
         main
         ;;
     *)
-        echo "Неизвестная опция: $1"
-        echo "Используйте --help для справки"
+        echo -e "${RED}Неизвестная опция: $1${NC}"
+        echo -e "${GRAY}Используйте --help для справки${NC}"
         exit 1
         ;;
 esac
