@@ -115,7 +115,7 @@ install_package() {
     # Для Ubuntu/Debian проверяем блокировку перед установкой
     if [[ "$OS" == "Ubuntu"* ]] || [[ "$OS" == "Debian"* ]]; then
         # Быстрая проверка блокировки
-        if pgrep -x unattended-upgr >/dev/null 2>&1; then
+        if is_dpkg_locked; then
             log_warning "Обнаружен процесс обновления системы. Ожидание..."
             if ! wait_for_dpkg_lock; then
                 log_error "Не удалось дождаться освобождения пакетного менеджера"
@@ -170,76 +170,156 @@ install_package() {
     return 0
 }
 
+# Проверка, заблокирован ли пакетный менеджер
+is_dpkg_locked() {
+    # Проверяем процессы, которые могут держать lock
+    if pgrep -f 'unattended-upgr|apt-get|apt\.systemd|dpkg' >/dev/null 2>&1; then
+        return 0  # Заблокирован
+    fi
+
+    # Проверяем lock файлы через fuser
+    if command -v fuser >/dev/null 2>&1; then
+        if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+           fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+           fuser /var/lib/apt/lists/lock >/dev/null 2>&1; then
+            return 0  # Заблокирован
+        fi
+    fi
+
+    # Проверяем lock файлы через lsof
+    if command -v lsof >/dev/null 2>&1; then
+        if lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+           lsof /var/lib/dpkg/lock >/dev/null 2>&1; then
+            return 0  # Заблокирован
+        fi
+    fi
+
+    return 1  # Свободен
+}
+
 # Ожидание освобождения dpkg lock
 wait_for_dpkg_lock() {
     log_info "Проверка доступности пакетного менеджера..."
     local max_wait=300  # Максимум 5 минут
     local waited=0
-    
-    # Функция проверки блокировки
-    check_lock() {
-        # Проверяем процессы unattended-upgrades
-        if pgrep -x unattended-upgr >/dev/null 2>&1; then
-            return 1  # Заблокирован
-        fi
-        
-        # Проверяем lock файлы через lsof если доступен
-        if command -v lsof >/dev/null 2>&1; then
-            if lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-               lsof /var/lib/dpkg/lock >/dev/null 2>&1; then
-                return 1  # Заблокирован
-            fi
-        fi
-        
-        # Проверяем через fuser если доступен
-        if command -v fuser >/dev/null 2>&1; then
-            if fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-               fuser /var/lib/dpkg/lock >/dev/null 2>&1; then
-                return 1  # Заблокирован
-            fi
-        fi
-        
-        # Пробуем проверить через попытку обновления (быстрая проверка)
-        if ! dpkg --configure -a >/dev/null 2>&1; then
-            # Если команда вернула ошибку, проверяем причину
-            if dpkg --configure -a 2>&1 | grep -q "lock"; then
-                return 1  # Заблокирован
-            fi
-        fi
-        
-        return 0  # Свободен
-    }
-    
+
     # Если уже свободен, возвращаемся сразу
-    if check_lock; then
+    if ! is_dpkg_locked; then
         return 0
     fi
-    
+
     log_warning "Пакетный менеджер заблокирован другим процессом (вероятно, обновление системы)"
     log_info "Ожидание освобождения..."
-    
+
     while [ $waited -lt $max_wait ]; do
-        if check_lock; then
-            log_success "Пакетный менеджер свободен"
-            return 0
+        if ! is_dpkg_locked; then
+            # Дополнительно проверяем, что dpkg --configure -a проходит
+            if dpkg --configure -a >/dev/null 2>&1; then
+                log_success "Пакетный менеджер свободен"
+                return 0
+            fi
         fi
-        
+
         sleep 5
         waited=$((waited + 5))
-        
+
         # Показываем прогресс каждые 30 секунд
         if [ $((waited % 30)) -eq 0 ]; then
             log_info "Ожидание... ($waited/$max_wait сек)"
-            log_info "   Можно завершить процесс обновления: sudo killall unattended-upgr"
         fi
     done
-    
+
     log_error "Не удалось дождаться освобождения пакетного менеджера (ожидалось $max_wait сек)"
-    log_error "Завершите процесс обновления системы:"
-    log_error "   sudo killall unattended-upgr"
-    log_error "   sudo systemctl stop unattended-upgrades"
-    log_error "Или подождите завершения обновления и запустите скрипт снова"
     return 1
+}
+
+# Проактивная очистка блокировок пакетного менеджера перед установкой
+# Останавливает автоматические обновления и ждёт освобождения lock
+ensure_package_manager_available() {
+    # Только для Debian/Ubuntu
+    if [[ "$PKG_MANAGER" != "apt-get" ]]; then
+        return 0
+    fi
+
+    log_info "Подготовка пакетного менеджера..."
+
+    # Останавливаем службы автоматических обновлений
+    local services_to_stop=("unattended-upgrades" "apt-daily.service" "apt-daily-upgrade.service")
+    for svc in "${services_to_stop[@]}"; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            log_info "Остановка $svc..."
+            systemctl stop "$svc" 2>/dev/null || true
+            systemctl mask "$svc" 2>/dev/null || true
+        fi
+    done
+
+    # Останавливаем таймеры автообновлений
+    local timers_to_stop=("apt-daily.timer" "apt-daily-upgrade.timer")
+    for timer in "${timers_to_stop[@]}"; do
+        if systemctl is-active --quiet "$timer" 2>/dev/null; then
+            log_info "Остановка таймера $timer..."
+            systemctl stop "$timer" 2>/dev/null || true
+            systemctl mask "$timer" 2>/dev/null || true
+        fi
+    done
+
+    # Если lock всё ещё занят — завершаем мешающие процессы
+    if is_dpkg_locked; then
+        log_warning "Пакетный менеджер заблокирован. Завершение мешающих процессов..."
+
+        # Даём текущим операциям 30 секунд на завершение
+        local grace_wait=0
+        while is_dpkg_locked && [ $grace_wait -lt 30 ]; do
+            sleep 2
+            grace_wait=$((grace_wait + 2))
+        done
+
+        # Если всё ещё заблокирован — принудительно завершаем
+        if is_dpkg_locked; then
+            log_warning "Принудительное завершение процессов, блокирующих пакетный менеджер..."
+            killall -9 unattended-upgr 2>/dev/null || true
+            killall -9 apt-get 2>/dev/null || true
+            killall -9 apt 2>/dev/null || true
+            sleep 2
+
+            # Удаляем stale lock файлы
+            rm -f /var/lib/dpkg/lock-frontend 2>/dev/null || true
+            rm -f /var/lib/dpkg/lock 2>/dev/null || true
+            rm -f /var/lib/apt/lists/lock 2>/dev/null || true
+            rm -f /var/cache/apt/archives/lock 2>/dev/null || true
+
+            # Восстанавливаем dpkg после прерывания
+            dpkg --configure -a >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # Финальная проверка
+    if is_dpkg_locked; then
+        log_error "Не удалось освободить пакетный менеджер"
+        return 1
+    fi
+
+    log_success "Пакетный менеджер готов к работе"
+    return 0
+}
+
+# Восстановление служб автоматических обновлений после установки
+restore_auto_updates() {
+    if [[ "${PKG_MANAGER:-}" != "apt-get" ]]; then
+        return 0
+    fi
+
+    log_info "Восстановление служб автоматических обновлений..."
+    local services=("unattended-upgrades" "apt-daily.service" "apt-daily-upgrade.service")
+    local timers=("apt-daily.timer" "apt-daily-upgrade.timer")
+
+    for svc in "${services[@]}"; do
+        systemctl unmask "$svc" 2>/dev/null || true
+    done
+    for timer in "${timers[@]}"; do
+        systemctl unmask "$timer" 2>/dev/null || true
+        systemctl start "$timer" 2>/dev/null || true
+    done
 }
 
 # Установка Docker
@@ -1114,7 +1194,7 @@ EOF
 
 http://{\$SELF_STEAL_DOMAIN} {
 	bind 0.0.0.0
-	redir https://{\$SELF_STEAL_DOMAIN}{uri} permanent
+	redir https://{host}{uri} permanent
 	log {
 		output file /var/log/caddy/redirect.log {
 			roll_size 5MB
@@ -1152,7 +1232,7 @@ EOF
 
 # Блок для внутреннего порта - использует internal сертификат
 # Используем отдельный адрес чтобы избежать конфликта с политикой сертификатов
-localhostlocalhost:{\$SELF_STEAL_PORT} {
+localhost:{\$SELF_STEAL_PORT} {
 	tls internal
 	respond 204
 	log off
@@ -1192,7 +1272,7 @@ EOF
 
 http://{\$SELF_STEAL_DOMAIN} {
 	bind 0.0.0.0
-	redir https://{\$SELF_STEAL_DOMAIN}{uri} permanent
+	redir https://{host}{uri} permanent
 	log {
 		output file /var/log/caddy/redirect.log {
 			roll_size 5MB
@@ -1893,6 +1973,11 @@ main() {
     log_info "Обнаружена ОС: $OS"
     echo
 
+    # Проактивная очистка блокировок пакетного менеджера (apt lock, unattended-upgrades)
+    ensure_package_manager_available
+
+    echo
+
     # Применение сетевых настроек (BBR, TCP tuning, лимиты)
     apply_network_settings
 
@@ -1944,6 +2029,10 @@ main() {
     install_grafana_monitoring
     
     echo
+
+    # Восстановление автоматических обновлений
+    restore_auto_updates
+
     log_success "Всё готово! Установка завершена."
 }
 
