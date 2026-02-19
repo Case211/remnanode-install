@@ -19,7 +19,6 @@ trap 'log_error "Ошибка на строке $LINENO. Команда: $BASH_C
 readonly RED='\033[0;31m'
 readonly GREEN='\033[0;32m'
 readonly YELLOW='\033[1;33m'
-readonly BLUE='\033[0;34m'
 readonly CYAN='\033[0;36m'
 readonly WHITE='\033[1;37m'
 readonly GRAY='\033[0;37m'
@@ -132,9 +131,14 @@ install_package() {
                 return 1
             fi
         fi
-        
-        if $PKG_MANAGER update -qq >"$install_log" 2>&1 && \
-           $PKG_MANAGER install -y -qq "$package" >>"$install_log" 2>&1; then
+
+        # apt-get update выполняется один раз, потом кешируется флагом
+        if [ "${_APT_UPDATED:-}" != "true" ]; then
+            $PKG_MANAGER update -qq >"$install_log" 2>&1 || true
+            _APT_UPDATED=true
+        fi
+
+        if $PKG_MANAGER install -y -qq "$package" >>"$install_log" 2>&1; then
             install_success=true
         else
             # Проверяем если это ошибка lock
@@ -144,8 +148,7 @@ install_package() {
                     log_info "Повторная попытка установки $package..."
                     rm -f "$install_log"
                     install_log=$(mktemp)
-                    if $PKG_MANAGER update -qq >"$install_log" 2>&1 && \
-                       $PKG_MANAGER install -y -qq "$package" >>"$install_log" 2>&1; then
+                    if $PKG_MANAGER install -y -qq "$package" >>"$install_log" 2>&1; then
                         install_success=true
                     fi
                 fi
@@ -1144,25 +1147,9 @@ services:
       - ./logs:/var/log/caddy
 EOF
 
-    # Если используется существующий сертификат, монтируем существующий volume
-    if [ "$USE_EXISTING_CERT" = true ]; then
-        # Проверяем существующий volume или создаем новый
-        if docker volume inspect caddy_data >/dev/null 2>&1; then
-            log_info "Используется существующий volume caddy_data для сертификатов"
-            cat >> "$CADDY_DIR/docker-compose.yml" << EOF
+    cat >> "$CADDY_DIR/docker-compose.yml" << EOF
       - caddy_data:/data
 EOF
-        else
-            log_info "Создается новый volume caddy_data для сертификатов"
-            cat >> "$CADDY_DIR/docker-compose.yml" << EOF
-      - caddy_data:/data
-EOF
-        fi
-    else
-        cat >> "$CADDY_DIR/docker-compose.yml" << EOF
-      - caddy_data:/data
-EOF
-    fi
 
     cat >> "$CADDY_DIR/docker-compose.yml" << EOF
       - caddy_config:/config
