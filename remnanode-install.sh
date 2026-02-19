@@ -2431,7 +2431,7 @@ main() {
     # Проактивная очистка блокировок пакетного менеджера (apt lock, unattended-upgrades)
     ensure_package_manager_available
     # Гарантируем восстановление автообновлений даже при падении скрипта
-    trap 'cleanup_temp_files; restore_auto_updates' EXIT
+    trap '_cleanup_on_exit; restore_auto_updates' EXIT
 
     echo
 
