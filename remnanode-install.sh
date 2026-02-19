@@ -7,6 +7,11 @@
 
 set -euo pipefail
 
+# Логирование в файл (дублирует весь вывод в лог, полезно при обрыве SSH-сессии)
+INSTALL_LOG="/var/log/remnanode-install.log"
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+echo "--- Начало установки: $(date) ---" >> "$INSTALL_LOG"
+
 # Обработка ошибок
 trap 'log_error "Ошибка на строке $LINENO. Команда: $BASH_COMMAND"' ERR
 
@@ -28,6 +33,9 @@ CADDY_DIR="$INSTALL_DIR/caddy"
 CADDY_HTML_DIR="$CADDY_DIR/html"
 CADDY_VERSION="2.10.2"
 CADDY_IMAGE="caddy:${CADDY_VERSION}"
+CADVISOR_VERSION="v0.53.0"
+NODE_EXPORTER_VERSION="1.9.1"
+VMAGENT_VERSION="v1.123.0"
 DEFAULT_PORT="9443"
 USE_WILDCARD=false
 USE_EXISTING_CERT=false
@@ -82,7 +90,7 @@ detect_os() {
             OS="Amazon"
         fi
     elif [ -f /etc/redhat-release ]; then
-        OS=$(cat /etc/redhat-release | awk '{print $1}')
+        OS=$(awk '{print $1}' /etc/redhat-release)
     elif [ -f /etc/arch-release ]; then
         OS="Arch"
     else
@@ -468,7 +476,7 @@ install_remnanode() {
         if [ "$remnanode_choice" = "2" ]; then
             log_warning "Удаление существующей установки RemnawaveNode..."
             if [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
-                cd "$REMNANODE_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
+                docker compose -f "$REMNANODE_DIR/docker-compose.yml" down 2>/dev/null || true
             fi
             rm -rf "$REMNANODE_DIR"
             log_success "Существующая установка удалена"
@@ -951,7 +959,7 @@ install_caddy_selfsteal() {
         if [ "$caddy_choice" = "2" ]; then
             log_warning "Удаление существующей установки Caddy..."
             if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
-                cd "$CADDY_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
+                docker compose -f "$CADDY_DIR/docker-compose.yml" down 2>/dev/null || true
             fi
             rm -rf "$CADDY_DIR"
             log_success "Существующая установка удалена"
@@ -1594,9 +1602,8 @@ install_grafana_monitoring() {
     mkdir -p /opt/monitoring/{cadvisor,nodeexporter,vmagent/conf.d}
     
     # Установка cadvisor
-    log_info "Установка cAdvisor..."
-    local cadvisor_version="v0.53.0"
-    local cadvisor_url="https://github.com/google/cadvisor/releases/download/${cadvisor_version}/cadvisor-${cadvisor_version}-linux-${ARCH}"
+    log_info "Установка cAdvisor ${CADVISOR_VERSION}..."
+    local cadvisor_url="https://github.com/google/cadvisor/releases/download/${CADVISOR_VERSION}/cadvisor-${CADVISOR_VERSION}-linux-${ARCH}"
 
     if ! wget --timeout=30 --tries=3 "$cadvisor_url" -q -O /opt/monitoring/cadvisor/cadvisor; then
         log_error "Не удалось скачать cAdvisor"
@@ -1606,10 +1613,9 @@ install_grafana_monitoring() {
     log_success "cAdvisor установлен"
 
     # Установка node_exporter
-    log_info "Установка Node Exporter..."
-    local node_exporter_version="1.9.1"
+    log_info "Установка Node Exporter ${NODE_EXPORTER_VERSION}..."
     local ne_dir="/opt/monitoring/nodeexporter"
-    local node_exporter_url="https://github.com/prometheus/node_exporter/releases/download/v${node_exporter_version}/node_exporter-${node_exporter_version}.linux-${ARCH}.tar.gz"
+    local node_exporter_url="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}.tar.gz"
 
     if ! wget --timeout=30 --tries=3 "$node_exporter_url" -q -O "${ne_dir}/node_exporter.tar.gz"; then
         log_error "Не удалось скачать Node Exporter"
@@ -1617,16 +1623,15 @@ install_grafana_monitoring() {
     fi
 
     tar -xzf "${ne_dir}/node_exporter.tar.gz" -C "${ne_dir}"
-    mv "${ne_dir}/node_exporter-${node_exporter_version}.linux-${ARCH}/node_exporter" "${ne_dir}/"
+    mv "${ne_dir}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}/node_exporter" "${ne_dir}/"
     chmod +x "${ne_dir}/node_exporter"
-    rm -rf "${ne_dir}/node_exporter-${node_exporter_version}.linux-${ARCH}" "${ne_dir}/node_exporter.tar.gz"
+    rm -rf "${ne_dir}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}" "${ne_dir}/node_exporter.tar.gz"
     log_success "Node Exporter установлен"
 
     # Установка vmagent
-    log_info "Установка VictoriaMetrics Agent..."
+    log_info "Установка VictoriaMetrics Agent ${VMAGENT_VERSION}..."
     local vm_dir="/opt/monitoring/vmagent"
-    local vmagent_version="v1.123.0"
-    local vmagent_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/${vmagent_version}/vmutils-linux-${ARCH}-${vmagent_version}.tar.gz"
+    local vmagent_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/${VMAGENT_VERSION}/vmutils-linux-${ARCH}-${VMAGENT_VERSION}.tar.gz"
 
     if ! wget --timeout=30 --tries=3 "$vmagent_url" -q -O "${vm_dir}/vmagent.tar.gz"; then
         log_error "Не удалось скачать VictoriaMetrics Agent"
@@ -2056,5 +2061,106 @@ main() {
     log_success "Всё готово! Установка завершена."
 }
 
+# Вывод справки
+show_help() {
+    echo "Использование: $(basename "$0") [ОПЦИЯ]"
+    echo
+    echo "Автоматическая установка RemnawaveNode + Caddy Selfsteal + Netbird + Grafana мониторинг"
+    echo
+    echo "Опции:"
+    echo "  --help        Показать эту справку"
+    echo "  --uninstall   Удалить все компоненты"
+    echo "  (без опций)   Запустить установку"
+    echo
+    echo "Компоненты:"
+    echo "  - RemnawaveNode (Docker)     → $REMNANODE_DIR"
+    echo "  - Caddy Selfsteal (Docker)   → $CADDY_DIR"
+    echo "  - Netbird VPN"
+    echo "  - Grafana мониторинг         → /opt/monitoring"
+    echo
+    echo "Лог установки: $INSTALL_LOG"
+}
+
+# Удаление всех компонентов
+uninstall_all() {
+    check_root
+
+    echo -e "${RED}⚠️  Удаление всех компонентов Remnawave${NC}"
+    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
+    echo
+    echo "Будут удалены:"
+    echo "  - RemnawaveNode ($REMNANODE_DIR)"
+    echo "  - Caddy Selfsteal ($CADDY_DIR)"
+    echo "  - Мониторинг (/opt/monitoring)"
+    echo "  - Данные Xray ($REMNANODE_DATA_DIR)"
+    echo
+    echo -e "${YELLOW}Docker volumes (caddy_data, caddy_config) НЕ будут удалены.${NC}"
+    echo -e "${YELLOW}Netbird НЕ будет удалён (используйте: apt remove netbird).${NC}"
+    echo
+    read -p "Вы уверены? Введите 'YES' для подтверждения: " -r confirm
+    if [ "$confirm" != "YES" ]; then
+        echo "Отменено."
+        exit 0
+    fi
+
+    echo
+
+    # Остановка контейнеров
+    if [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
+        log_info "Остановка RemnawaveNode..."
+        docker compose -f "$REMNANODE_DIR/docker-compose.yml" down 2>/dev/null || true
+        log_success "RemnawaveNode остановлен"
+    fi
+
+    if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
+        log_info "Остановка Caddy..."
+        docker compose -f "$CADDY_DIR/docker-compose.yml" down 2>/dev/null || true
+        log_success "Caddy остановлен"
+    fi
+
+    # Остановка мониторинга
+    if systemctl is-active --quiet cadvisor 2>/dev/null || \
+       systemctl is-active --quiet nodeexporter 2>/dev/null || \
+       systemctl is-active --quiet vmagent 2>/dev/null; then
+        log_info "Остановка мониторинга..."
+        systemctl stop cadvisor nodeexporter vmagent 2>/dev/null || true
+        systemctl disable cadvisor nodeexporter vmagent 2>/dev/null || true
+        rm -f /etc/systemd/system/cadvisor.service
+        rm -f /etc/systemd/system/nodeexporter.service
+        rm -f /etc/systemd/system/vmagent.service
+        systemctl daemon-reload
+        log_success "Мониторинг остановлен"
+    fi
+
+    # Удаление директорий
+    log_info "Удаление файлов..."
+    rm -rf "$REMNANODE_DIR"
+    rm -rf "$REMNANODE_DATA_DIR"
+    rm -rf "$CADDY_DIR"
+    rm -rf /opt/monitoring
+
+    echo
+    log_success "Все компоненты удалены"
+    echo -e "${GRAY}Для удаления Docker volumes: docker volume rm caddy_data caddy_config${NC}"
+    echo -e "${GRAY}Для удаления Netbird: apt remove netbird (или yum remove netbird)${NC}"
+}
+
 # Запуск
-main "$@"
+case "${1:-}" in
+    --help|-h)
+        show_help
+        exit 0
+        ;;
+    --uninstall)
+        uninstall_all
+        exit 0
+        ;;
+    "")
+        main
+        ;;
+    *)
+        echo "Неизвестная опция: $1"
+        echo "Используйте --help для справки"
+        exit 1
+        ;;
+esac
