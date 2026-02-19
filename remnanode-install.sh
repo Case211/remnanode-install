@@ -796,6 +796,37 @@ check_docker_compose() {
     exit 1
 }
 
+# Открытие портов в файерволе (ufw)
+ensure_firewall_ports() {
+    # Проверяем наличие ufw
+    if ! command -v ufw >/dev/null 2>&1; then
+        log_info "ufw не установлен — пропуск настройки файервола"
+        return 0
+    fi
+
+    # Проверяем активен ли ufw
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        log_info "ufw неактивен — порты уже доступны"
+        return 0
+    fi
+
+    log_info "Настройка файервола (ufw)..."
+
+    # 443/tcp — Xray Reality (входящий трафик клиентов)
+    if ! ufw status 2>/dev/null | grep -qE "443/tcp.*ALLOW"; then
+        ufw allow 443/tcp >/dev/null 2>&1 && log_success "Порт 443/tcp открыт (Xray Reality)" || log_warning "Не удалось открыть порт 443/tcp"
+    else
+        log_success "Порт 443/tcp уже открыт"
+    fi
+
+    # 80/tcp — нужен для HTTP-01 challenge (получение сертификата Caddy)
+    if ! ufw status 2>/dev/null | grep -qE "80/tcp.*ALLOW"; then
+        ufw allow 80/tcp >/dev/null 2>&1 && log_success "Порт 80/tcp открыт (HTTP-01 challenge)" || log_warning "Не удалось открыть порт 80/tcp"
+    else
+        log_success "Порт 80/tcp уже открыт"
+    fi
+}
+
 # Проверка существующей установки RemnawaveNode
 check_existing_remnanode() {
     if [ -d "$REMNANODE_DIR" ] && [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
@@ -2431,7 +2462,7 @@ main() {
     # Проактивная очистка блокировок пакетного менеджера (apt lock, unattended-upgrades)
     ensure_package_manager_available
     # Гарантируем восстановление автообновлений даже при падении скрипта
-    trap 'cleanup_temp_files; restore_auto_updates' EXIT
+    trap '_cleanup_on_exit; restore_auto_updates' EXIT
 
     echo
 
@@ -2522,6 +2553,11 @@ main() {
 
     # Установка Caddy Selfsteal
     install_caddy_selfsteal
+
+    echo
+
+    # Открытие портов 443 и 80 в файерволе
+    ensure_firewall_ports
 
     echo
 
