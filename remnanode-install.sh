@@ -44,7 +44,8 @@ get_server_ip() {
     echo "${ip:-127.0.0.1}"
 }
 
-NODE_IP=$(get_server_ip)
+# NODE_IP инициализируется в main() после check_root
+NODE_IP=""
 
 # Функции логирования
 log_info() {
@@ -172,8 +173,13 @@ install_package() {
 
 # Проверка, заблокирован ли пакетный менеджер
 is_dpkg_locked() {
-    # Проверяем процессы, которые могут держать lock
-    if pgrep -f 'unattended-upgr|apt-get|apt\.systemd|dpkg' >/dev/null 2>&1; then
+    # Проверяем процессы, которые могут держать lock (точное совпадение имени процесса)
+    if pgrep -x 'dpkg' >/dev/null 2>&1 || \
+       pgrep -x 'apt-get' >/dev/null 2>&1 || \
+       pgrep -x 'apt' >/dev/null 2>&1 || \
+       pgrep -x 'aptitude' >/dev/null 2>&1 || \
+       pgrep -f 'unattended-upgr' >/dev/null 2>&1 || \
+       pgrep -f 'apt.systemd.daily' >/dev/null 2>&1; then
         return 0  # Заблокирован
     fi
 
@@ -581,7 +587,15 @@ EOF
     log_info "Запуск RemnawaveNode..."
     cd "$REMNANODE_DIR"
     docker compose up -d
-    log_success "RemnawaveNode запущен"
+
+    # Проверка что контейнер поднялся
+    sleep 3
+    if docker compose ps 2>/dev/null | grep -qE "Up|running"; then
+        log_success "RemnawaveNode запущен"
+    else
+        log_warning "RemnawaveNode может не запуститься корректно. Проверьте логи:"
+        log_warning "   cd $REMNANODE_DIR && docker compose logs"
+    fi
 }
 
 # Установка Xray-core
@@ -660,38 +674,32 @@ install_xray_core() {
     log_info "Скачивание Xray-core версии ${latest_release}..."
     log_info "URL: $xray_download_url"
     
-    # Переходим в директорию данных
-    if ! cd "$REMNANODE_DATA_DIR"; then
-        log_error "Не удалось перейти в директорию: $REMNANODE_DATA_DIR"
-        return 1
-    fi
-    
-    # Скачиваем файл
-    if ! wget --timeout=30 --tries=3 "${xray_download_url}" -q -O "${xray_filename}"; then
+    # Скачиваем файл в директорию данных
+    if ! wget --timeout=30 --tries=3 "${xray_download_url}" -q -O "${REMNANODE_DATA_DIR}/${xray_filename}"; then
         log_error "Не удалось скачать Xray-core"
         log_error "Проверьте интернет-соединение и доступность GitHub"
         return 1
     fi
     
-    if [ ! -f "${xray_filename}" ]; then
+    if [ ! -f "${REMNANODE_DATA_DIR}/${xray_filename}" ]; then
         log_error "Файл ${xray_filename} не найден после скачивания"
         return 1
     fi
-    
+
     local file_size
-    file_size=$(stat -c%s "${xray_filename}" 2>/dev/null || echo "unknown")
+    file_size=$(stat -c%s "${REMNANODE_DATA_DIR}/${xray_filename}" 2>/dev/null || echo "unknown")
     log_success "Файл скачан (размер: ${file_size} байт)"
-    
+
     # Распаковка
     log_info "Распаковка Xray-core..."
-    if ! unzip -o "${xray_filename}" -d "$REMNANODE_DATA_DIR" >/dev/null 2>&1; then
+    if ! unzip -o "${REMNANODE_DATA_DIR}/${xray_filename}" -d "$REMNANODE_DATA_DIR" >/dev/null 2>&1; then
         log_error "Не удалось распаковать архив"
-        rm -f "${xray_filename}"
+        rm -f "${REMNANODE_DATA_DIR}/${xray_filename}"
         return 1
     fi
-    
+
     # Удаляем архив
-    rm -f "${xray_filename}"
+    rm -f "${REMNANODE_DATA_DIR}/${xray_filename}"
     
     # Проверяем что xray файл существует
     if [ ! -f "$REMNANODE_DATA_DIR/xray" ]; then
@@ -765,17 +773,17 @@ download_template() {
     # Создание директории
     mkdir -p "$CADDY_HTML_DIR"
     rm -rf "${CADDY_HTML_DIR:?}"/* 2>/dev/null || true
-    cd "$CADDY_HTML_DIR"
-    
-    # Попытка загрузки через git
+
+    # Попытка загрузки через git (в подоболочке чтобы не менять рабочую директорию)
     if command -v git >/dev/null 2>&1; then
         local temp_dir="/tmp/selfsteal-template-$$"
         mkdir -p "$temp_dir"
-        
+
         if git clone --filter=blob:none --sparse "https://github.com/DigneZzZ/remnawave-scripts.git" "$temp_dir" 2>/dev/null; then
-            cd "$temp_dir"
-            git sparse-checkout set "sni-templates/$template_folder" 2>/dev/null
-            
+            (
+                cd "$temp_dir"
+                git sparse-checkout set "sni-templates/$template_folder" 2>/dev/null
+            )
             local source_path="$temp_dir/sni-templates/$template_folder"
             if [ -d "$source_path" ] && cp -r "$source_path"/* "$CADDY_HTML_DIR/" 2>/dev/null; then
                 rm -rf "$temp_dir"
@@ -785,25 +793,25 @@ download_template() {
         fi
         rm -rf "$temp_dir"
     fi
-    
+
     # Fallback: загрузка основных файлов через curl
     log_info "Использование fallback метода загрузки..."
     local base_url="https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/sni-templates/$template_folder"
     local common_files=("index.html" "favicon.ico")
-    
+
     local files_downloaded=0
     for file in "${common_files[@]}"; do
         local url="$base_url/$file"
-        if curl -fsSL "$url" -o "$file" 2>/dev/null; then
-            ((files_downloaded++))
+        if curl -fsSL "$url" -o "$CADDY_HTML_DIR/$file" 2>/dev/null; then
+            files_downloaded=$((files_downloaded + 1))
         fi
     done
-    
+
     if [ $files_downloaded -gt 0 ]; then
         log_success "Базовые файлы шаблона загружены"
         return 0
     fi
-    
+
     # Создание простого fallback HTML
     create_fallback_html
     return 1
@@ -940,10 +948,7 @@ install_caddy_selfsteal() {
         echo
         read -p "Выберите опцию [1-2]: " caddy_choice
         
-        if [ "$caddy_choice" = "1" ]; then
-            log_info "Установка Caddy Selfsteal пропущена"
-            return 0
-        else
+        if [ "$caddy_choice" = "2" ]; then
             log_warning "Удаление существующей установки Caddy..."
             if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
                 cd "$CADDY_DIR" 2>/dev/null && docker compose down 2>/dev/null || true
@@ -951,6 +956,9 @@ install_caddy_selfsteal() {
             rm -rf "$CADDY_DIR"
             log_success "Существующая установка удалена"
             echo
+        else
+            log_info "Установка Caddy Selfsteal пропущена"
+            return 0
         fi
     fi
     
@@ -1293,12 +1301,44 @@ EOF
     
     download_template "$template_folder" "Template $template_id" || true
     
+    # Проверка занятости портов перед запуском
+    log_info "Проверка доступности портов..."
+    local port_conflict=false
+    if ss -tlnp 2>/dev/null | grep -q ":80 "; then
+        local port80_proc
+        port80_proc=$(ss -tlnp 2>/dev/null | grep ":80 " | head -1)
+        log_warning "Порт 80 уже занят: $port80_proc"
+        port_conflict=true
+    fi
+    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        local port_proc
+        port_proc=$(ss -tlnp 2>/dev/null | grep ":${port} " | head -1)
+        log_warning "Порт $port уже занят: $port_proc"
+        port_conflict=true
+    fi
+    if [ "$port_conflict" = true ]; then
+        echo
+        read -p "Порты заняты. Продолжить запуск Caddy? (y/n): " -r force_start
+        if [[ ! $force_start =~ ^[Yy]$ ]]; then
+            log_warning "Запуск Caddy отложен. Запустите вручную: cd $CADDY_DIR && docker compose up -d"
+            return 0
+        fi
+    fi
+
     # Запуск Caddy
     log_info "Запуск Caddy..."
     cd "$CADDY_DIR"
     docker compose up -d
-    log_success "Caddy запущен"
-    
+
+    # Проверка что контейнер поднялся
+    sleep 3
+    if docker compose ps 2>/dev/null | grep -qE "Up|running"; then
+        log_success "Caddy запущен"
+    else
+        log_warning "Caddy может не запуститься корректно. Проверьте логи:"
+        log_warning "   cd $CADDY_DIR && docker compose logs"
+    fi
+
     # Вывод итоговой информации
     echo
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
@@ -1318,7 +1358,6 @@ EOF
     fi
     echo -e "${GRAY}   dest: \"127.0.0.1:$port\"${NC}"
     echo -e "${GRAY}   xver: 0${NC}"
-    echo -e "${GRAY}   serverNames: совпадает с доменом выше${NC}"
     echo
     echo -e "${WHITE}📁 Пути установки:${NC}"
     echo -e "${GRAY}   RemnawaveNode: $REMNANODE_DIR${NC}"
@@ -1556,49 +1595,48 @@ install_grafana_monitoring() {
     
     # Установка cadvisor
     log_info "Установка cAdvisor..."
-    cd /opt/monitoring/cadvisor
     local cadvisor_version="v0.53.0"
     local cadvisor_url="https://github.com/google/cadvisor/releases/download/${cadvisor_version}/cadvisor-${cadvisor_version}-linux-${ARCH}"
-    
-    if ! wget --timeout=30 --tries=3 "$cadvisor_url" -q -O cadvisor; then
+
+    if ! wget --timeout=30 --tries=3 "$cadvisor_url" -q -O /opt/monitoring/cadvisor/cadvisor; then
         log_error "Не удалось скачать cAdvisor"
         return 1
     fi
-    chmod +x cadvisor
+    chmod +x /opt/monitoring/cadvisor/cadvisor
     log_success "cAdvisor установлен"
-    
+
     # Установка node_exporter
     log_info "Установка Node Exporter..."
-    cd /opt/monitoring/nodeexporter
     local node_exporter_version="1.9.1"
+    local ne_dir="/opt/monitoring/nodeexporter"
     local node_exporter_url="https://github.com/prometheus/node_exporter/releases/download/v${node_exporter_version}/node_exporter-${node_exporter_version}.linux-${ARCH}.tar.gz"
-    
-    if ! wget --timeout=30 --tries=3 "$node_exporter_url" -q -O node_exporter.tar.gz; then
+
+    if ! wget --timeout=30 --tries=3 "$node_exporter_url" -q -O "${ne_dir}/node_exporter.tar.gz"; then
         log_error "Не удалось скачать Node Exporter"
         return 1
     fi
-    
-    tar -xzf node_exporter.tar.gz
-    mv node_exporter-${node_exporter_version}.linux-${ARCH}/node_exporter ./
-    chmod +x node_exporter
-    rm -rf node_exporter-${node_exporter_version}.linux-${ARCH} node_exporter.tar.gz
+
+    tar -xzf "${ne_dir}/node_exporter.tar.gz" -C "${ne_dir}"
+    mv "${ne_dir}/node_exporter-${node_exporter_version}.linux-${ARCH}/node_exporter" "${ne_dir}/"
+    chmod +x "${ne_dir}/node_exporter"
+    rm -rf "${ne_dir}/node_exporter-${node_exporter_version}.linux-${ARCH}" "${ne_dir}/node_exporter.tar.gz"
     log_success "Node Exporter установлен"
-    
+
     # Установка vmagent
     log_info "Установка VictoriaMetrics Agent..."
-    cd /opt/monitoring/vmagent
+    local vm_dir="/opt/monitoring/vmagent"
     local vmagent_version="v1.123.0"
     local vmagent_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/${vmagent_version}/vmutils-linux-${ARCH}-${vmagent_version}.tar.gz"
-    
-    if ! wget --timeout=30 --tries=3 "$vmagent_url" -q -O vmagent.tar.gz; then
+
+    if ! wget --timeout=30 --tries=3 "$vmagent_url" -q -O "${vm_dir}/vmagent.tar.gz"; then
         log_error "Не удалось скачать VictoriaMetrics Agent"
         return 1
     fi
-    
-    tar -xzf vmagent.tar.gz
-    mv vmagent-prod vmagent
-    rm -f vmagent.tar.gz vmalert-prod vmauth-prod vmbackup-prod vmrestore-prod vmctl-prod
-    chmod +x vmagent
+
+    tar -xzf "${vm_dir}/vmagent.tar.gz" -C "${vm_dir}"
+    mv "${vm_dir}/vmagent-prod" "${vm_dir}/vmagent"
+    rm -f "${vm_dir}/vmagent.tar.gz" "${vm_dir}/vmalert-prod" "${vm_dir}/vmauth-prod" "${vm_dir}/vmbackup-prod" "${vm_dir}/vmrestore-prod" "${vm_dir}/vmctl-prod"
+    chmod +x "${vm_dir}/vmagent"
     log_success "VictoriaMetrics Agent установлен"
     
     # Запрос имени инстанса
@@ -1936,7 +1974,10 @@ main() {
     
     # Проверка root
     check_root
-    
+
+    # Получение IP сервера (после check_root, чтобы не тратить время на curl если не root)
+    NODE_IP=$(get_server_ip)
+
     # Определение ОС
     detect_os
     detect_package_manager
