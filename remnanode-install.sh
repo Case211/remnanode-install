@@ -2022,6 +2022,24 @@ main() {
     else
         log_success "wget уже установлен"
     fi
+    if ! command -v nano >/dev/null 2>&1; then
+        if install_package nano; then
+            log_success "nano установлен"
+        else
+            log_warning "Не удалось установить nano (некритично)"
+        fi
+    else
+        log_success "nano уже установлен"
+    fi
+    if ! command -v btop >/dev/null 2>&1; then
+        if install_package btop; then
+            log_success "btop установлен"
+        else
+            log_warning "Не удалось установить btop (некритично)"
+        fi
+    else
+        log_success "btop уже установлен"
+    fi
     echo
     
     # Установка Docker
