@@ -394,7 +394,7 @@ show_installation_summary() {
         echo -e "${GRAY}  Домен: $DETAIL_CADDY_DOMAIN${NC}"
     fi
     if [ -n "$DETAIL_CADDY_PORT" ]; then
-        echo -e "${GRAY}  HTTPS порт: $DETAIL_CADDY_PORT${NC}"
+        echo -e "${GRAY}  Selfsteal порт: $DETAIL_CADDY_PORT (внутренний, 127.0.0.1)${NC}"
     fi
     if [ -n "$DETAIL_NETBIRD_IP" ]; then
         echo -e "${GRAY}  Netbird IP: $DETAIL_NETBIRD_IP${NC}"
@@ -1520,20 +1520,51 @@ install_caddy_selfsteal() {
         fi
     fi
     
-    # Запрос порта
+    # Запрос порта (внутренний selfsteal порт, НЕ внешний 443)
     local input_port
+    local port
     if [ "${NON_INTERACTIVE:-false}" = true ]; then
-        input_port="$CFG_CADDY_PORT"
+        port="${CFG_CADDY_PORT:-$DEFAULT_PORT}"
+        # Валидация порта
+        if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+            log_error "Неверный номер порта: $port"
+            exit 1
+        fi
+        if [ "$port" -eq 443 ]; then
+            log_error "Порт 443 зарезервирован для Xray Reality (внешний трафик клиентов)"
+            log_error "Selfsteal порт должен быть другим (например, $DEFAULT_PORT)"
+            log_error "Порт 443 → Xray Reality (внешний), selfsteal порт → Caddy (внутренний, 127.0.0.1)"
+            exit 1
+        fi
+        if [ "$port" -eq 80 ]; then
+            log_error "Порт 80 зарезервирован для HTTP-01 challenge / редиректов"
+            log_error "Selfsteal порт должен быть другим (например, $DEFAULT_PORT)"
+            exit 1
+        fi
     else
-        echo
-        read -p "Введите HTTPS порт (по умолчанию $DEFAULT_PORT): " input_port
-    fi
-    local port="${input_port:-$DEFAULT_PORT}"
-    
-    # Валидация порта
-    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
-        log_error "Неверный номер порта"
-        exit 1
+        while true; do
+            echo
+            echo -e "${GRAY}   Этот порт используется ВНУТРИ сервера для selfsteal (127.0.0.1)${NC}"
+            echo -e "${GRAY}   Внешний порт 443 зарезервирован для Xray Reality${NC}"
+            read -p "Введите внутренний HTTPS порт для Caddy selfsteal (по умолчанию $DEFAULT_PORT): " input_port
+            port="${input_port:-$DEFAULT_PORT}"
+            # Валидация порта
+            if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+                log_error "Неверный номер порта"
+                continue
+            fi
+            if [ "$port" -eq 443 ]; then
+                log_warning "Порт 443 зарезервирован для Xray Reality (внешний трафик клиентов)"
+                log_warning "Caddy selfsteal работает внутри на 127.0.0.1 — используйте другой порт"
+                continue
+            fi
+            if [ "$port" -eq 80 ]; then
+                log_warning "Порт 80 зарезервирован для HTTP-01 challenge / редиректов"
+                log_warning "Используйте другой порт для selfsteal"
+                continue
+            fi
+            break
+        done
     fi
     DETAIL_CADDY_PORT="$port"
 
@@ -1783,6 +1814,9 @@ EOF
     fi
     echo -e "${GRAY}   dest: \"127.0.0.1:$port\"${NC}"
     echo -e "${GRAY}   xver: 0${NC}"
+    echo
+    echo -e "${CYAN}   Внешний порт 443 → Xray Reality (клиенты)${NC}"
+    echo -e "${CYAN}   Внутренний порт $port → Caddy selfsteal (127.0.0.1)${NC}"
     echo
     echo -e "${WHITE}📁 Пути установки:${NC}"
     echo -e "${GRAY}   RemnawaveNode: $REMNANODE_DIR${NC}"
@@ -2606,7 +2640,7 @@ show_help() {
     echo -e "  ${CYAN}CFG_DOMAIN${NC}=\"reality.example.com\" ${GRAY}# Домен${NC}"
     echo -e "  ${CYAN}CFG_NODE_PORT${NC}=3000           ${GRAY}# Порт ноды${NC}"
     echo -e "  ${CYAN}CFG_CERT_TYPE${NC}=1              ${GRAY}# 1=обычный, 2=wildcard${NC}"
-    echo -e "  ${CYAN}CFG_CADDY_PORT${NC}=9443          ${GRAY}# HTTPS порт Caddy${NC}"
+    echo -e "  ${CYAN}CFG_CADDY_PORT${NC}=9443          ${GRAY}# Внутренний selfsteal порт Caddy (НЕ 443/80)${NC}"
     echo -e "  ${CYAN}CFG_INSTALL_NETBIRD${NC}=n         ${GRAY}# Установка Netbird (y/n)${NC}"
     echo -e "  ${CYAN}CFG_INSTALL_MONITORING${NC}=n      ${GRAY}# Установка мониторинга (y/n)${NC}"
     echo
