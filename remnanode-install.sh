@@ -5,7 +5,13 @@
 # ║  Только установка, без лишних функций                           ║
 # ╚════════════════════════════════════════════════════════════════╝
 
-set -euo pipefail
+set -Eeuo pipefail
+
+# Проверка версии bash (требуется 4.0+ для массивов и ассоциативных массивов)
+if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "Ошибка: требуется bash версии 4.0 или выше (текущая: $BASH_VERSION)" >&2
+    exit 1
+fi
 
 # Логирование в файл (ANSI-коды очищаются при выходе)
 INSTALL_LOG="/var/log/remnanode-install.log"
@@ -18,6 +24,10 @@ TEMP_FILES=()
 # Функция очистки при выходе
 _cleanup_on_exit() {
     local exit_code=$?
+    # Восстановление автообновлений если были остановлены
+    if [ "${_RESTORE_AUTO_UPDATES:-false}" = true ]; then
+        restore_auto_updates 2>/dev/null || true
+    fi
     # Очистка temp файлов
     for f in "${TEMP_FILES[@]}"; do
         rm -f "$f" 2>/dev/null || true
@@ -50,9 +60,9 @@ CADDY_DIR="$INSTALL_DIR/caddy"
 CADDY_HTML_DIR="$CADDY_DIR/html"
 CADDY_VERSION="2.10.2"
 CADDY_IMAGE="caddy:${CADDY_VERSION}"
-CADVISOR_VERSION="v0.53.0"
+CADVISOR_VERSION="0.53.0"
 NODE_EXPORTER_VERSION="1.9.1"
-VMAGENT_VERSION="v1.123.0"
+VMAGENT_VERSION="1.123.0"
 DEFAULT_PORT="9443"
 USE_WILDCARD=false
 USE_EXISTING_CERT=false
@@ -181,7 +191,7 @@ prompt_choice() {
 
     # Non-interactive: использовать default
     if [ "${NON_INTERACTIVE:-false}" = true ]; then
-        eval "$result_var=\"${default:-1}\""
+        printf -v "$result_var" '%s' "${default:-1}"
         return 0
     fi
 
@@ -189,11 +199,11 @@ prompt_choice() {
         read -p "$prompt" -r _choice
         # Если пустой ввод и есть default
         if [ -z "$_choice" ] && [ -n "$default" ]; then
-            eval "$result_var=\"$default\""
+            printf -v "$result_var" '%s' "$default"
             return 0
         fi
         if [[ "$_choice" =~ ^[0-9]+$ ]] && [ "$_choice" -ge 1 ] && [ "$_choice" -le "$max" ]; then
-            eval "$result_var=\"$_choice\""
+            printf -v "$result_var" '%s' "$_choice"
             return 0
         fi
         log_warning "Неверный выбор. Введите число от 1 до $max."
@@ -265,6 +275,9 @@ backup_existing_config() {
             for f in "$dir"/.env "$dir"/docker-compose.yml "$dir"/Caddyfile; do
                 [ -f "$f" ] && cp "$f" "$backup_dir/" 2>/dev/null || true
             done
+            # Защита секретов в бэкапе
+            chmod 700 "$backup_dir"
+            [ -f "$backup_dir/.env" ] && chmod 600 "$backup_dir/.env"
             log_info "Бэкап конфигурации: $backup_dir"
         fi
     fi
@@ -297,10 +310,19 @@ fetch_latest_version() {
     local repo="$1"
     local default="$2"
 
-    local version
-    version=$(curl -s --connect-timeout 5 --max-time 10 \
-        "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
-        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 | sed 's/^v//')
+    local version=""
+    local api_response
+    api_response=$(curl -s --connect-timeout 5 --max-time 10 \
+        "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null) || true
+
+    if [ -n "$api_response" ]; then
+        # Используем jq если доступен, иначе sed
+        if command -v jq >/dev/null 2>&1; then
+            version=$(echo "$api_response" | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+        else
+            version=$(echo "$api_response" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 | sed 's/^v//')
+        fi
+    fi
 
     if [ -n "$version" ]; then
         echo "$version"
@@ -317,7 +339,7 @@ check_container_health() {
 
     local waited=0
     while [ $waited -lt "$max_wait" ]; do
-        if docker compose -f "$compose_dir/docker-compose.yml" ps 2>/dev/null | grep -qE "Up|running"; then
+        if docker compose --project-directory "$compose_dir" ps "$service_name" 2>/dev/null | grep -qE "Up|running"; then
             return 0
         fi
         sleep 2
@@ -331,6 +353,16 @@ load_config_file() {
     local config_file="${1:-$CONFIG_FILE}"
 
     if [ -f "$config_file" ]; then
+        # Проверка безопасности конфиг-файла
+        local file_owner file_perms
+        file_owner=$(stat -c '%U' "$config_file" 2>/dev/null || echo "unknown")
+        file_perms=$(stat -c '%a' "$config_file" 2>/dev/null || echo "unknown")
+        if [ "$file_owner" != "root" ]; then
+            log_warning "Конфиг-файл $config_file принадлежит $file_owner (ожидается root)"
+        fi
+        if [[ "$file_perms" =~ [0-7][2367][0-7] ]]; then
+            log_warning "Конфиг-файл $config_file доступен на запись группе/другим (права: $file_perms)"
+        fi
         log_info "Загрузка конфигурации из $config_file"
         # shellcheck source=/dev/null
         source "$config_file"
@@ -632,13 +664,22 @@ ensure_package_manager_available() {
             grace_wait=$((grace_wait + 2))
         done
 
-        # Если всё ещё заблокирован — принудительно завершаем
+        # Если всё ещё заблокирован — сначала мягко (SIGTERM), потом принудительно
         if is_dpkg_locked; then
-            log_warning "Принудительное завершение процессов, блокирующих пакетный менеджер..."
-            killall -9 unattended-upgr 2>/dev/null || true
-            killall -9 apt-get 2>/dev/null || true
-            killall -9 apt 2>/dev/null || true
-            sleep 2
+            log_warning "Завершение процессов, блокирующих пакетный менеджер (SIGTERM)..."
+            killall unattended-upgr 2>/dev/null || true
+            killall apt-get 2>/dev/null || true
+            killall apt 2>/dev/null || true
+            sleep 5
+
+            # Если SIGTERM не помог — SIGKILL
+            if is_dpkg_locked; then
+                log_warning "Принудительное завершение процессов (SIGKILL)..."
+                killall -9 unattended-upgr 2>/dev/null || true
+                killall -9 apt-get 2>/dev/null || true
+                killall -9 apt 2>/dev/null || true
+                sleep 2
+            fi
 
             # Удаляем stale lock файлы
             rm -f /var/lib/dpkg/lock-frontend 2>/dev/null || true
@@ -722,8 +763,17 @@ install_docker() {
         docker_install_log=$(create_temp_file)
         local install_success=false
 
+        # Скачиваем скрипт установки Docker в файл для безопасности
+        local docker_script
+        docker_script=$(create_temp_file)
+        if ! curl -fsSL https://get.docker.com -o "$docker_script" 2>/dev/null; then
+            log_error "Не удалось скачать скрипт установки Docker"
+            rm -f "$docker_install_log" "$docker_script"
+            return 1
+        fi
+
         # Пробуем установить Docker
-        if curl -fsSL https://get.docker.com 2>/dev/null | sh >"$docker_install_log" 2>&1; then
+        if sh "$docker_script" >"$docker_install_log" 2>&1; then
             install_success=true
         else
             # Проверяем если это ошибка lock
@@ -733,12 +783,13 @@ install_docker() {
                     log_info "Повторная попытка установки Docker..."
                     rm -f "$docker_install_log"
                     docker_install_log=$(create_temp_file)
-                    if curl -fsSL https://get.docker.com 2>/dev/null | sh >"$docker_install_log" 2>&1; then
+                    if sh "$docker_script" >"$docker_install_log" 2>&1; then
                         install_success=true
                     fi
                 fi
             fi
         fi
+        rm -f "$docker_script"
         
         if [ "$install_success" = false ]; then
             log_error "Ошибка установки Docker. Лог:"
@@ -855,7 +906,7 @@ install_remnanode() {
             backup_existing_config "$REMNANODE_DIR"
             log_warning "Удаление существующей установки RemnawaveNode..."
             if [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
-                docker compose -f "$REMNANODE_DIR/docker-compose.yml" down 2>/dev/null || true
+                docker compose --project-directory "$REMNANODE_DIR" down 2>/dev/null || true
             fi
             rm -rf "$REMNANODE_DIR"
             log_success "Существующая установка удалена"
@@ -959,7 +1010,7 @@ services:
 EOF
     
     # Добавление volumes если Xray установлен
-    if [ "$INSTALL_XRAY" == "true" ]; then
+    if [ "$INSTALL_XRAY" = "true" ]; then
         cat >> "$REMNANODE_DIR/docker-compose.yml" << EOF
     volumes:
       - $REMNANODE_DATA_DIR/xray:/usr/local/bin/xray
@@ -986,8 +1037,7 @@ EOF
     
     # Запуск контейнера
     log_info "Запуск RemnawaveNode..."
-    cd "$REMNANODE_DIR"
-    docker compose up -d
+    docker compose --project-directory "$REMNANODE_DIR" up -d
 
     # Проверка что контейнер поднялся (с ожиданием до 30 сек)
     log_info "Ожидание запуска контейнера..."
@@ -1148,10 +1198,10 @@ validate_domain_dns() {
         fi
     fi
     
-    # Проверка DNS
+    # Проверка DNS (фильтруем только IPv4 адреса, исключая CNAME)
     local dns_ip
-    dns_ip=$(dig +short "$domain" A | tail -1)
-    
+    dns_ip=$(dig +short "$domain" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | tail -1)
+
     if [ -z "$dns_ip" ]; then
         log_warning "Не удалось получить IP для домена $domain"
         return 1
@@ -1175,14 +1225,14 @@ download_template() {
     
     # Создание директории
     mkdir -p "$CADDY_HTML_DIR"
-    rm -rf "${CADDY_HTML_DIR:?}"/* 2>/dev/null || true
+    find "${CADDY_HTML_DIR:?}" -mindepth 1 -delete 2>/dev/null || true
 
     # Попытка загрузки через git (в подоболочке чтобы не менять рабочую директорию)
     if command -v git >/dev/null 2>&1; then
         local temp_dir="/tmp/selfsteal-template-$$"
         mkdir -p "$temp_dir"
 
-        if git clone --filter=blob:none --sparse "https://github.com/DigneZzZ/remnawave-scripts.git" "$temp_dir" 2>/dev/null; then
+        if git clone --filter=blob:none --sparse "https://github.com/Case211/remnanode-install.git" "$temp_dir" 2>/dev/null; then
             (
                 cd "$temp_dir"
                 git sparse-checkout set "sni-templates/$template_folder" 2>/dev/null
@@ -1199,7 +1249,7 @@ download_template() {
 
     # Fallback: загрузка основных файлов через curl
     log_info "Использование fallback метода загрузки..."
-    local base_url="https://raw.githubusercontent.com/DigneZzZ/remnawave-scripts/main/sni-templates/$template_folder"
+    local base_url="https://raw.githubusercontent.com/Case211/remnanode-install/main/sni-templates/$template_folder"
     local common_files=("index.html" "favicon.ico")
 
     local files_downloaded=0
@@ -1357,7 +1407,7 @@ install_caddy_selfsteal() {
             backup_existing_config "$CADDY_DIR"
             log_warning "Удаление существующей установки Caddy..."
             if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
-                docker compose -f "$CADDY_DIR/docker-compose.yml" down 2>/dev/null || true
+                docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
             fi
             rm -rf "$CADDY_DIR"
             log_success "Существующая установка удалена"
@@ -1389,6 +1439,9 @@ install_caddy_selfsteal() {
             read -p "Введите домен (например, reality.example.com): " original_domain
             if [ -z "$original_domain" ]; then
                 log_error "Домен не может быть пустым!"
+            elif ! [[ "$original_domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || ! [[ "$original_domain" == *.* ]]; then
+                log_error "Неверный формат домена: $original_domain"
+                original_domain=""
             fi
         done
     fi
@@ -1717,7 +1770,7 @@ EOF
     # Загрузка случайного шаблона
     echo
     log_info "Загрузка шаблона..."
-    local templates=("1:10gag" "2:convertit" "3:converter" "4:downloader" "5:filecloud" "6:games-site" "7:modmanager" "8:speedtest" "9:YouTube")
+    local templates=("1:10gag" "2:503-1" "3:503-2" "4:convertit" "5:converter" "6:downloader" "7:filecloud" "8:games-site" "9:modmanager" "10:speedtest" "11:YouTube")
     local random_template=${templates[$RANDOM % ${#templates[@]}]}
     local template_id=$(echo "$random_template" | cut -d: -f1)
     local template_folder=$(echo "$random_template" | cut -d: -f2)
@@ -1750,8 +1803,7 @@ EOF
 
     # Запуск Caddy
     log_info "Запуск Caddy..."
-    cd "$CADDY_DIR"
-    docker compose up -d
+    docker compose --project-directory "$CADDY_DIR" up -d
 
     # Проверка что контейнер поднялся (с ожиданием до 30 сек)
     log_info "Ожидание запуска контейнера..."
@@ -1874,11 +1926,17 @@ install_netbird() {
     
     log_info "Установка Netbird..."
     
-    # Установка через официальный скрипт
-    local install_log
+    # Установка через официальный скрипт (скачиваем в файл для безопасности)
+    local install_log netbird_script
     install_log=$(create_temp_file)
-    if curl -fsSL https://pkgs.netbird.io/install.sh 2>/dev/null | sh >"$install_log" 2>&1; then
-        rm -f "$install_log"
+    netbird_script=$(create_temp_file)
+    if ! curl -fsSL https://pkgs.netbird.io/install.sh -o "$netbird_script" 2>/dev/null; then
+        log_error "Не удалось скачать скрипт установки Netbird"
+        rm -f "$install_log" "$netbird_script"
+        return 1
+    fi
+    if sh "$netbird_script" >"$install_log" 2>&1; then
+        rm -f "$install_log" "$netbird_script"
         log_success "Netbird установлен"
     else
         log_error "Ошибка установки Netbird"
@@ -1886,7 +1944,7 @@ install_netbird() {
             local error_details=$(tail -5 "$install_log" | tr '\n' ' ' | head -c 200)
             log_error "Детали: $error_details"
         fi
-        rm -f "$install_log"
+        rm -f "$install_log" "$netbird_script"
         return 1
     fi
     
@@ -1931,7 +1989,7 @@ connect_netbird() {
 
     log_info "Подключение к Netbird..."
 
-    # Подключение
+    # Подключение (setup key виден в ps, но он одноразовый)
     if netbird up --setup-key "$setup_key" 2>&1; then
         log_success "Подключение к Netbird выполнено"
 
@@ -2031,14 +2089,19 @@ install_grafana_monitoring() {
 
     log_info "Обнаружена архитектура: $ARCH"
     
+    # Создание пользователя для мониторинга (node_exporter и vmagent не требуют root)
+    if ! id -u monitoring >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin monitoring 2>/dev/null || true
+    fi
+
     # Создание директорий
     mkdir -p /opt/monitoring/{cadvisor,nodeexporter,vmagent/conf.d}
     
     # Установка cadvisor
-    log_info "Установка cAdvisor ${CADVISOR_VERSION}..."
-    local cadvisor_url="https://github.com/google/cadvisor/releases/download/${CADVISOR_VERSION}/cadvisor-${CADVISOR_VERSION}-linux-${ARCH}"
+    log_info "Установка cAdvisor v${CADVISOR_VERSION}..."
+    local cadvisor_url="https://github.com/google/cadvisor/releases/download/v${CADVISOR_VERSION}/cadvisor-v${CADVISOR_VERSION}-linux-${ARCH}"
 
-    if ! download_with_progress "$cadvisor_url" "/opt/monitoring/cadvisor/cadvisor" "Скачивание cAdvisor ${CADVISOR_VERSION}..."; then
+    if ! download_with_progress "$cadvisor_url" "/opt/monitoring/cadvisor/cadvisor" "Скачивание cAdvisor v${CADVISOR_VERSION}..."; then
         log_error "Не удалось скачать cAdvisor"
         return 1
     fi
@@ -2062,11 +2125,11 @@ install_grafana_monitoring() {
     log_success "Node Exporter установлен"
 
     # Установка vmagent
-    log_info "Установка VictoriaMetrics Agent ${VMAGENT_VERSION}..."
+    log_info "Установка VictoriaMetrics Agent v${VMAGENT_VERSION}..."
     local vm_dir="/opt/monitoring/vmagent"
-    local vmagent_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/${VMAGENT_VERSION}/vmutils-linux-${ARCH}-${VMAGENT_VERSION}.tar.gz"
+    local vmagent_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v${VMAGENT_VERSION}/vmutils-linux-${ARCH}-v${VMAGENT_VERSION}.tar.gz"
 
-    if ! download_with_progress "$vmagent_url" "${vm_dir}/vmagent.tar.gz" "Скачивание VictoriaMetrics Agent ${VMAGENT_VERSION}..."; then
+    if ! download_with_progress "$vmagent_url" "${vm_dir}/vmagent.tar.gz" "Скачивание VictoriaMetrics Agent v${VMAGENT_VERSION}..."; then
         log_error "Не удалось скачать VictoriaMetrics Agent"
         return 1
     fi
@@ -2167,7 +2230,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     
-    # Node Exporter service
+    # Node Exporter service (не требует root)
     cat > /etc/systemd/system/nodeexporter.service << EOF
 [Unit]
 Description=Node Exporter
@@ -2175,8 +2238,8 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-User=root
-Group=root
+User=monitoring
+Group=monitoring
 Type=simple
 ExecStart=/opt/monitoring/nodeexporter/node_exporter --web.listen-address=127.0.0.1:9100
 Restart=always
@@ -2187,6 +2250,9 @@ WantedBy=multi-user.target
 EOF
     
     # VictoriaMetrics Agent service
+    # VictoriaMetrics Agent service (не требует root)
+    chown -R monitoring:monitoring /opt/monitoring/vmagent
+    chown -R monitoring:monitoring /opt/monitoring/nodeexporter
     cat > /etc/systemd/system/vmagent.service << EOF
 [Unit]
 Description=VictoriaMetrics Agent
@@ -2194,8 +2260,8 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-User=root
-Group=root
+User=monitoring
+Group=monitoring
 Type=simple
 ExecStart=/opt/monitoring/vmagent/vmagent \\
       -httpListenAddr=127.0.0.1:8429 \\
@@ -2320,10 +2386,10 @@ apply_network_settings() {
 # ║  Оптимизация сети для VPN/Proxy нод                           ║
 # ╚════════════════════════════════════════════════════════════════╝
 
-# === IPv6 (Отключен для стабильности) ===
+# === IPv6 (Отключен для стабильности, lo оставлен для совместимости) ===
 net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 0
 
 # === IPv4 и Маршрутизация ===
 net.ipv4.ip_forward = 1
@@ -2362,7 +2428,6 @@ net.ipv4.tcp_syncookies = 1
 # === Системные лимиты ===
 fs.file-max = 2097152
 vm.swappiness = 10
-vm.overcommit_memory = 1
 EOF
 
     log_success "Конфигурация sysctl создана: $sysctl_file"
@@ -2427,7 +2492,7 @@ EOF
 
 # Главная функция
 main() {
-    clear
+    echo
     echo -e "${WHITE}🚀 Установка RemnawaveNode + Caddy Selfsteal${NC}"
     echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
     echo
@@ -2461,30 +2526,30 @@ main() {
 
     # Проактивная очистка блокировок пакетного менеджера (apt lock, unattended-upgrades)
     ensure_package_manager_available
-    # Гарантируем восстановление автообновлений даже при падении скрипта
-    trap '_cleanup_on_exit; restore_auto_updates' EXIT
+    # Флаг для восстановления автообновлений при выходе
+    _RESTORE_AUTO_UPDATES=true
 
     echo
 
     # Автоопределение последних версий компонентов
     log_info "Проверка актуальных версий компонентов..."
     local new_cadvisor new_node_exporter new_vmagent
-    new_cadvisor=$(fetch_latest_version "google/cadvisor" "${CADVISOR_VERSION#v}")
+    new_cadvisor=$(fetch_latest_version "google/cadvisor" "$CADVISOR_VERSION")
     new_node_exporter=$(fetch_latest_version "prometheus/node_exporter" "$NODE_EXPORTER_VERSION")
-    new_vmagent=$(fetch_latest_version "VictoriaMetrics/VictoriaMetrics" "${VMAGENT_VERSION#v}")
+    new_vmagent=$(fetch_latest_version "VictoriaMetrics/VictoriaMetrics" "$VMAGENT_VERSION")
 
     # Обновляем версии если получены более новые
-    if [ -n "$new_cadvisor" ] && [ "$new_cadvisor" != "${CADVISOR_VERSION#v}" ]; then
-        CADVISOR_VERSION="v$new_cadvisor"
-        log_info "cAdvisor: $CADVISOR_VERSION (обновлено)"
+    if [ -n "$new_cadvisor" ] && [ "$new_cadvisor" != "$CADVISOR_VERSION" ]; then
+        CADVISOR_VERSION="$new_cadvisor"
+        log_info "cAdvisor: v$CADVISOR_VERSION (обновлено)"
     fi
     if [ -n "$new_node_exporter" ] && [ "$new_node_exporter" != "$NODE_EXPORTER_VERSION" ]; then
         NODE_EXPORTER_VERSION="$new_node_exporter"
-        log_info "Node Exporter: $NODE_EXPORTER_VERSION (обновлено)"
+        log_info "Node Exporter: v$NODE_EXPORTER_VERSION (обновлено)"
     fi
-    if [ -n "$new_vmagent" ] && [ "$new_vmagent" != "${VMAGENT_VERSION#v}" ]; then
-        VMAGENT_VERSION="v$new_vmagent"
-        log_info "VM Agent: $VMAGENT_VERSION (обновлено)"
+    if [ -n "$new_vmagent" ] && [ "$new_vmagent" != "$VMAGENT_VERSION" ]; then
+        VMAGENT_VERSION="$new_vmagent"
+        log_info "VM Agent: v$VMAGENT_VERSION (обновлено)"
     fi
     echo
 
@@ -2513,23 +2578,24 @@ main() {
     else
         log_success "wget уже установлен"
     fi
-    if ! command -v nano >/dev/null 2>&1; then
-        if install_package nano; then
-            log_success "nano установлен"
-        else
-            log_warning "Не удалось установить nano (некритично)"
+    # Опциональные утилиты (не требуются для работы)
+    if ! command -v nano >/dev/null 2>&1 || ! command -v btop >/dev/null 2>&1; then
+        if prompt_yn "Установить дополнительные утилиты (nano, btop)? (y/n): " "n"; then
+            if ! command -v nano >/dev/null 2>&1; then
+                if install_package nano; then
+                    log_success "nano установлен"
+                else
+                    log_warning "Не удалось установить nano (некритично)"
+                fi
+            fi
+            if ! command -v btop >/dev/null 2>&1; then
+                if install_package btop; then
+                    log_success "btop установлен"
+                else
+                    log_warning "Не удалось установить btop (некритично)"
+                fi
+            fi
         fi
-    else
-        log_success "nano уже установлен"
-    fi
-    if ! command -v btop >/dev/null 2>&1; then
-        if install_package btop; then
-            log_success "btop установлен"
-        else
-            log_warning "Не удалось установить btop (некритично)"
-        fi
-    else
-        log_success "btop уже установлен"
     fi
     echo
 
@@ -2571,8 +2637,9 @@ main() {
 
     echo
 
-    # Восстановление автоматических обновлений
+    # Восстановление автоматических обновлений (также вызывается автоматически из _cleanup_on_exit)
     restore_auto_updates
+    _RESTORE_AUTO_UPDATES=false
 
     # Итоговое саммари
     show_installation_summary
@@ -2645,13 +2712,13 @@ uninstall_all() {
     # Остановка контейнеров
     if [ -f "$REMNANODE_DIR/docker-compose.yml" ]; then
         log_info "Остановка RemnawaveNode..."
-        docker compose -f "$REMNANODE_DIR/docker-compose.yml" down 2>/dev/null || true
+        docker compose --project-directory "$REMNANODE_DIR" down 2>/dev/null || true
         log_success "RemnawaveNode остановлен"
     fi
 
     if [ -f "$CADDY_DIR/docker-compose.yml" ]; then
         log_info "Остановка Caddy..."
-        docker compose -f "$CADDY_DIR/docker-compose.yml" down 2>/dev/null || true
+        docker compose --project-directory "$CADDY_DIR" down 2>/dev/null || true
         log_success "Caddy остановлен"
     fi
 
