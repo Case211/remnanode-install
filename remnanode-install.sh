@@ -89,12 +89,16 @@ CFG_INSTALL_MONITORING="${CFG_INSTALL_MONITORING:-n}"
 CFG_INSTANCE_NAME="${CFG_INSTANCE_NAME:-}"
 CFG_GRAFANA_IP="${CFG_GRAFANA_IP:-}"
 CFG_APPLY_NETWORK="${CFG_APPLY_NETWORK:-y}"
+CFG_SETUP_UFW="${CFG_SETUP_UFW:-y}"
+CFG_INSTALL_FAIL2BAN="${CFG_INSTALL_FAIL2BAN:-y}"
 
 # Отслеживание статуса установки для финального саммари
 STATUS_NETWORK="пропущен"
 STATUS_DOCKER="пропущен"
 STATUS_REMNANODE="пропущен"
 STATUS_CADDY="пропущен"
+STATUS_UFW="пропущен"
+STATUS_FAIL2BAN="пропущен"
 STATUS_NETBIRD="пропущен"
 STATUS_MONITORING="пропущен"
 
@@ -378,7 +382,7 @@ show_installation_summary() {
     echo -e "${GRAY}$(printf '═%.0s' $(seq 1 56))${NC}"
     echo
 
-    local -a components=("network:Сетевые настройки" "docker:Docker" "remnanode:RemnawaveNode" "caddy:Caddy Selfsteal" "netbird:Netbird VPN" "monitoring:Мониторинг Grafana")
+    local -a components=("network:Сетевые настройки" "docker:Docker" "remnanode:RemnawaveNode" "caddy:Caddy Selfsteal" "ufw:UFW Firewall" "fail2ban:Fail2ban" "netbird:Netbird VPN" "monitoring:Мониторинг Grafana")
 
     for entry in "${components[@]}"; do
         local key="${entry%%:*}"
@@ -390,6 +394,8 @@ show_installation_summary() {
             docker)      status="$STATUS_DOCKER" ;;
             remnanode)   status="$STATUS_REMNANODE" ;;
             caddy)       status="$STATUS_CADDY" ;;
+            ufw)         status="$STATUS_UFW" ;;
+            fail2ban)    status="$STATUS_FAIL2BAN" ;;
             netbird)     status="$STATUS_NETBIRD" ;;
             monitoring)  status="$STATUS_MONITORING" ;;
         esac
@@ -702,6 +708,64 @@ ensure_package_manager_available() {
     return 0
 }
 
+# Установка XanMod ядра с поддержкой BBR2/BBR3
+install_xanmod_kernel() {
+    # Только для Debian/Ubuntu x86_64
+    local arch
+    arch=$(uname -m)
+    if [ "$arch" != "x86_64" ]; then
+        log_error "XanMod доступен только для x86_64 (текущая: $arch)"
+        return 1
+    fi
+
+    # Проверка совместимости процессора (уровень ISA)
+    local xanmod_level=""
+    if grep -q "v4" /proc/cpuinfo 2>/dev/null && grep -q "avx512" /proc/cpuinfo 2>/dev/null; then
+        xanmod_level="x64v4"
+    elif grep -q "avx2" /proc/cpuinfo 2>/dev/null; then
+        xanmod_level="x64v3"
+    elif grep -q "sse4_2" /proc/cpuinfo 2>/dev/null; then
+        xanmod_level="x64v2"
+    else
+        xanmod_level="x64v1"
+    fi
+    log_info "Уровень ISA процессора: $xanmod_level"
+
+    # Добавление репозитория XanMod
+    log_info "Добавление репозитория XanMod..."
+
+    if ! command -v gpg >/dev/null 2>&1; then
+        install_package gnupg 2>/dev/null || true
+    fi
+
+    local xanmod_key="/usr/share/keyrings/xanmod-archive-keyring.gpg"
+    if ! curl -fsSL https://dl.xanmod.org/archive.key 2>/dev/null | gpg --dearmor -o "$xanmod_key" 2>/dev/null; then
+        log_error "Не удалось добавить GPG ключ XanMod"
+        return 1
+    fi
+
+    echo "deb [signed-by=$xanmod_key] http://deb.xanmod.org releases main" > /etc/apt/sources.list.d/xanmod-release.list
+
+    # Обновление списка пакетов
+    apt-get update -qq >/dev/null 2>&1 || true
+
+    # Установка ядра XanMod MAIN (стабильная ветка с BBR2)
+    local kernel_pkg="linux-xanmod-${xanmod_level}"
+    log_info "Установка пакета: $kernel_pkg..."
+
+    if apt-get install -y -qq "$kernel_pkg" >/dev/null 2>&1; then
+        log_success "XanMod ядро ($xanmod_level) установлено"
+        log_warning "Для активации BBR2 необходима перезагрузка сервера!"
+        return 0
+    else
+        log_error "Не удалось установить $kernel_pkg"
+        # Очистка
+        rm -f "$xanmod_key" /etc/apt/sources.list.d/xanmod-release.list
+        apt-get update -qq >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
 # Восстановление служб автоматических обновлений после установки
 restore_auto_updates() {
     if [[ "${PKG_MANAGER:-}" != "apt-get" ]]; then
@@ -847,34 +911,257 @@ check_docker_compose() {
     exit 1
 }
 
-# Открытие портов в файерволе (ufw)
-ensure_firewall_ports() {
-    # Проверяем наличие ufw
+# Полная настройка UFW файервола
+setup_ufw() {
+    echo
+    echo -e "${WHITE}🛡️  Настройка UFW Firewall${NC}"
+    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
+    echo
+
+    if ! prompt_yn "Настроить UFW файервол (default deny + whitelist портов)? (y/n): " "y" "$CFG_SETUP_UFW"; then
+        log_info "Настройка UFW пропущена"
+        return 0
+    fi
+
+    # Установка ufw если не установлен
     if ! command -v ufw >/dev/null 2>&1; then
-        log_info "ufw не установлен — пропуск настройки файервола"
-        return 0
+        log_info "Установка ufw..."
+        if ! install_package ufw; then
+            log_error "Не удалось установить ufw"
+            STATUS_UFW="ошибка"
+            return 1
+        fi
     fi
 
-    # Проверяем активен ли ufw
-    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-        log_info "ufw неактивен — порты уже доступны"
-        return 0
-    fi
+    log_info "Настройка правил UFW..."
 
-    log_info "Настройка файервола (ufw)..."
+    # Сброс и базовые политики
+    ufw --force reset >/dev/null 2>&1
+    ufw default deny incoming >/dev/null 2>&1
+    ufw default allow outgoing >/dev/null 2>&1
+    log_success "Политика: deny incoming, allow outgoing"
+
+    # SSH — открываем первым чтобы не потерять доступ
+    ufw allow 22/tcp >/dev/null 2>&1 && log_success "Порт 22/tcp открыт (SSH)" || log_warning "Не удалось открыть порт 22/tcp"
 
     # 443/tcp — Xray Reality (входящий трафик клиентов)
-    if ! ufw status 2>/dev/null | grep -qE "443/tcp.*ALLOW"; then
-        ufw allow 443/tcp >/dev/null 2>&1 && log_success "Порт 443/tcp открыт (Xray Reality)" || log_warning "Не удалось открыть порт 443/tcp"
-    else
-        log_success "Порт 443/tcp уже открыт"
+    ufw allow 443/tcp >/dev/null 2>&1 && log_success "Порт 443/tcp открыт (Xray Reality)" || log_warning "Не удалось открыть порт 443/tcp"
+
+    # 80/tcp — HTTP-01 challenge / Caddy redirect
+    ufw allow 80/tcp >/dev/null 2>&1 && log_success "Порт 80/tcp открыт (HTTP-01 challenge)" || log_warning "Не удалось открыть порт 80/tcp"
+
+    # Caddy HTTPS порт (если отличается от 443)
+    local caddy_port="${DETAIL_CADDY_PORT:-$DEFAULT_PORT}"
+    if [ -n "$caddy_port" ] && [ "$caddy_port" != "443" ]; then
+        ufw allow "$caddy_port/tcp" >/dev/null 2>&1 && log_success "Порт ${caddy_port}/tcp открыт (Caddy HTTPS)" || log_warning "Не удалось открыть порт ${caddy_port}/tcp"
     fi
 
-    # 80/tcp — нужен для HTTP-01 challenge (получение сертификата Caddy)
-    if ! ufw status 2>/dev/null | grep -qE "80/tcp.*ALLOW"; then
-        ufw allow 80/tcp >/dev/null 2>&1 && log_success "Порт 80/tcp открыт (HTTP-01 challenge)" || log_warning "Не удалось открыть порт 80/tcp"
+    # Активация UFW
+    ufw --force enable >/dev/null 2>&1
+    log_success "UFW активирован"
+
+    # Показать статус
+    echo
+    log_info "Текущие правила UFW:"
+    ufw status numbered 2>/dev/null | head -20
+
+    STATUS_UFW="настроен"
+}
+
+# Установка и настройка Fail2ban
+install_fail2ban() {
+    echo
+    echo -e "${WHITE}🛡️  Установка Fail2ban${NC}"
+    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
+    echo
+
+    if ! prompt_yn "Установить Fail2ban (защита SSH, Caddy, порт-сканы)? (y/n): " "y" "$CFG_INSTALL_FAIL2BAN"; then
+        log_info "Установка Fail2ban пропущена"
+        return 0
+    fi
+
+    # Проверка существующей установки
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        echo
+        echo -e "${YELLOW}⚠️  Fail2ban уже установлен${NC}"
+        echo
+        echo -e "${WHITE}Выберите действие:${NC}"
+        echo -e "   ${WHITE}1)${NC} ${GRAY}Пропустить (оставить текущую конфигурацию)${NC}"
+        echo -e "   ${WHITE}2)${NC} ${YELLOW}Перенастроить Fail2ban${NC}"
+        echo
+
+        local f2b_choice
+        prompt_choice "Выберите опцию [1-2]: " 2 f2b_choice
+
+        if [ "$f2b_choice" = "1" ]; then
+            STATUS_FAIL2BAN="уже установлен"
+            log_info "Настройка Fail2ban пропущена"
+            return 0
+        fi
+    fi
+
+    # Установка fail2ban
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+        log_info "Установка fail2ban..."
+        if ! install_package fail2ban; then
+            log_error "Не удалось установить fail2ban"
+            STATUS_FAIL2BAN="ошибка"
+            return 1
+        fi
+        log_success "fail2ban установлен"
+    fi
+
+    # Создание директории для логов remnanode (для будущих фильтров)
+    mkdir -p /var/log/remnanode
+
+    # Создание кастомного фильтра для Caddy (JSON логи)
+    log_info "Создание фильтров Fail2ban..."
+
+    cat > /etc/fail2ban/filter.d/caddy-status.conf << 'EOF'
+[Definition]
+# Детект подозрительных запросов к Caddy из JSON access.log
+# Ловим 4xx ошибки (сканеры, брутфорс путей)
+failregex = "client_ip":"<HOST>".*"status":(401|403|404|405|444)
+ignoreregex =
+EOF
+
+    # Создание фильтра для порт-сканирования (через iptables LOG)
+    cat > /etc/fail2ban/filter.d/portscan.conf << 'EOF'
+[Definition]
+# Детект порт-сканирования через iptables LOG
+failregex = PORTSCAN.*SRC=<HOST>
+ignoreregex =
+EOF
+
+    # Настройка iptables правила для логирования порт-сканов
+    log_info "Настройка детекта порт-сканирования..."
+
+    # Создание systemd сервиса для iptables правила (переживает перезагрузку)
+    cat > /etc/systemd/system/portscan-detect.service << 'EOF'
+[Unit]
+Description=Portscan detection iptables rules
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -N PORTSCAN 2>/dev/null || true; iptables -F PORTSCAN 2>/dev/null || true; iptables -A PORTSCAN -p tcp --tcp-flags ALL NONE -j LOG --log-prefix "PORTSCAN: " --log-level 4; iptables -A PORTSCAN -p tcp --tcp-flags ALL ALL -j LOG --log-prefix "PORTSCAN: " --log-level 4; iptables -A PORTSCAN -p tcp --tcp-flags ALL FIN,URG,PSH -j LOG --log-prefix "PORTSCAN: " --log-level 4; iptables -A PORTSCAN -p tcp --tcp-flags SYN,RST SYN,RST -j LOG --log-prefix "PORTSCAN: " --log-level 4; iptables -A PORTSCAN -p tcp --tcp-flags SYN,FIN SYN,FIN -j LOG --log-prefix "PORTSCAN: " --log-level 4; iptables -D INPUT -j PORTSCAN 2>/dev/null || true; iptables -I INPUT -j PORTSCAN'
+ExecStop=/bin/sh -c 'iptables -D INPUT -j PORTSCAN 2>/dev/null || true; iptables -F PORTSCAN 2>/dev/null || true; iptables -X PORTSCAN 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable portscan-detect >/dev/null 2>&1
+    systemctl start portscan-detect >/dev/null 2>&1 || log_warning "Не удалось запустить portscan-detect (iptables может быть недоступен)"
+
+    # Создание jail.local
+    log_info "Создание конфигурации jail.local..."
+
+    cat > /etc/fail2ban/jail.local << 'EOF'
+# ╔════════════════════════════════════════════════════════════════╗
+# ║  Remnawave Fail2ban Configuration                              ║
+# ╚════════════════════════════════════════════════════════════════╝
+
+[DEFAULT]
+# Бан через UFW
+banaction = ufw
+banaction_allports = ufw
+# Игнорировать localhost и приватные сети
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+# Время бана по умолчанию — 1 час
+bantime = 3600
+# Окно поиска — 10 минут
+findtime = 600
+# Количество попыток по умолчанию
+maxretry = 5
+
+# ── SSH защита от брутфорса ──────────────────────────────────────
+[sshd]
+enabled = true
+port = 22
+filter = sshd
+backend = systemd
+maxretry = 5
+findtime = 600
+bantime = 3600
+
+# ── Caddy — подозрительные запросы (сканеры, 4xx) ────────────────
+[caddy-status]
+enabled = true
+port = http,https
+filter = caddy-status
+logpath = /opt/caddy/logs/access.log
+maxretry = 15
+findtime = 600
+bantime = 3600
+
+# ── Детект порт-сканирования ─────────────────────────────────────
+[portscan]
+enabled = true
+filter = portscan
+logpath = /var/log/kern.log
+maxretry = 3
+findtime = 300
+bantime = 86400
+EOF
+
+    log_success "jail.local создан"
+
+    # Перезапуск fail2ban
+    log_info "Запуск Fail2ban..."
+    systemctl enable fail2ban >/dev/null 2>&1
+    systemctl restart fail2ban >/dev/null 2>&1
+
+    # Проверка статуса
+    sleep 2
+    if systemctl is-active --quiet fail2ban; then
+        log_success "Fail2ban запущен"
+
+        echo
+        log_info "Активные jail'ы:"
+        fail2ban-client status 2>/dev/null | grep "Jail list" || true
+        echo
+
+        STATUS_FAIL2BAN="установлен"
     else
-        log_success "Порт 80/tcp уже открыт"
+        log_warning "Fail2ban не запустился. Проверьте: journalctl -u fail2ban"
+        STATUS_FAIL2BAN="ошибка"
+    fi
+
+    echo
+    echo -e "${WHITE}📋 Конфигурация Fail2ban:${NC}"
+    echo -e "${GRAY}   SSH: maxretry=5, bantime=1ч${NC}"
+    echo -e "${GRAY}   Caddy: maxretry=15, bantime=1ч${NC}"
+    echo -e "${GRAY}   Порт-сканы: maxretry=3, bantime=24ч${NC}"
+    echo -e "${GRAY}   Конфиг: /etc/fail2ban/jail.local${NC}"
+    echo
+}
+
+# Настройка logrotate для логов RemnawaveNode
+setup_logrotate() {
+    log_info "Настройка logrotate для RemnawaveNode..."
+
+    # Установка logrotate если не установлен
+    if ! command -v logrotate >/dev/null 2>&1; then
+        install_package logrotate 2>/dev/null || true
+    fi
+
+    if command -v logrotate >/dev/null 2>&1; then
+        cat > /etc/logrotate.d/remnanode << 'EOF'
+/var/log/remnanode/*.log {
+    size 50M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+        log_success "logrotate настроен: /etc/logrotate.d/remnanode"
+    else
+        log_warning "logrotate не установлен, пропуск настройки ротации логов"
     fi
 }
 
@@ -1009,29 +1296,35 @@ services:
     restart: always
 EOF
     
-    # Добавление volumes если Xray установлен
+    # Добавление volumes
     if [ "$INSTALL_XRAY" = "true" ]; then
         cat >> "$REMNANODE_DIR/docker-compose.yml" << EOF
     volumes:
+      - /var/log/remnanode:/var/log/remnanode
       - $REMNANODE_DATA_DIR/xray:/usr/local/bin/xray
 EOF
-        
+
         if [ -f "$REMNANODE_DATA_DIR/geoip.dat" ]; then
             echo "      - $REMNANODE_DATA_DIR/geoip.dat:/usr/local/share/xray/geoip.dat" >> "$REMNANODE_DIR/docker-compose.yml"
         fi
         if [ -f "$REMNANODE_DATA_DIR/geosite.dat" ]; then
             echo "      - $REMNANODE_DATA_DIR/geosite.dat:/usr/local/share/xray/geosite.dat" >> "$REMNANODE_DIR/docker-compose.yml"
         fi
-        
+
         cat >> "$REMNANODE_DIR/docker-compose.yml" << EOF
       - /dev/shm:/dev/shm  # Для selfsteal socket access
 EOF
     else
         cat >> "$REMNANODE_DIR/docker-compose.yml" << EOF
-    # volumes:
-    #   - /dev/shm:/dev/shm  # Раскомментируйте для selfsteal socket access
+    volumes:
+      - /var/log/remnanode:/var/log/remnanode
+      # - /dev/shm:/dev/shm  # Раскомментируйте для selfsteal socket access
 EOF
     fi
+
+    # Создание директории для логов и настройка logrotate
+    mkdir -p /var/log/remnanode
+    setup_logrotate
     
     log_success "docker-compose.yml создан"
     
@@ -2355,24 +2648,66 @@ apply_network_settings() {
         fi
     fi
 
-    # Проверка поддержки BBR2 (требует ядро 5.18+ или пропатченное)
-    log_info "Проверка поддержки BBR2..."
-    BBR_MODULE="tcp_bbr2"
-    BBR_ALGO="bbr2"
+    # Проверка поддержки BBR: bbr3 (ядро 6.12+) → bbr2 (XanMod) → bbr (стандартный)
+    log_info "Проверка поддержки BBR..."
+    BBR_MODULE=""
+    BBR_ALGO=""
 
-    if ! grep -q "tcp_bbr2" /proc/modules 2>/dev/null && ! modprobe tcp_bbr2 2>/dev/null; then
-        log_warning "Модуль BBR2 не найден, пробуем BBR1 как fallback..."
+    # 1. Пробуем BBR3 (встроен в ядро 6.12+)
+    if grep -q "bbr3" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
         BBR_MODULE="tcp_bbr"
-        BBR_ALGO="bbr"
-        if ! grep -q "tcp_bbr" /proc/modules 2>/dev/null && ! modprobe tcp_bbr 2>/dev/null; then
-            modprobe tcp_bbr 2>/dev/null || true
-        fi
-    fi
-
-    if lsmod | grep -q "$BBR_MODULE" 2>/dev/null; then
-        log_success "Модуль ${BBR_MODULE} загружен"
+        BBR_ALGO="bbr3"
+        log_success "BBR3 доступен (ядро $(uname -r))"
+    # 2. Пробуем BBR2 (XanMod / пропатченные ядра)
+    elif grep -q "bbr2" /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        BBR_MODULE="tcp_bbr2"
+        BBR_ALGO="bbr2"
+        log_success "BBR2 доступен (ядро $(uname -r))"
+    elif grep -q "tcp_bbr2" /proc/modules 2>/dev/null || modprobe tcp_bbr2 2>/dev/null; then
+        BBR_MODULE="tcp_bbr2"
+        BBR_ALGO="bbr2"
+        log_success "Модуль BBR2 загружен"
     else
-        log_warning "${BBR_MODULE} может быть недоступен на этом ядре"
+        # 3. BBR2 недоступен — предлагаем установить XanMod ядро
+        log_warning "BBR2/BBR3 недоступны на текущем ядре ($(uname -r))"
+
+        # Установка XanMod только для Debian/Ubuntu
+        if [[ "$PKG_MANAGER" = "apt-get" ]]; then
+            echo
+            echo -e "${WHITE}🔧 Установка ядра XanMod с поддержкой BBR2:${NC}"
+            echo -e "   ${WHITE}1)${NC} ${GRAY}Установить XanMod ядро с BBR2 (рекомендуется, требуется перезагрузка)${NC}"
+            echo -e "   ${WHITE}2)${NC} ${GRAY}Использовать стандартный BBR1${NC}"
+            echo
+
+            local bbr_choice
+            prompt_choice "Выберите опцию [1-2]: " 2 bbr_choice
+
+            if [ "$bbr_choice" = "1" ]; then
+                log_info "Установка XanMod ядра..."
+                if install_xanmod_kernel; then
+                    # После установки ядра BBR2 будет доступен после перезагрузки
+                    BBR_MODULE="tcp_bbr2"
+                    BBR_ALGO="bbr2"
+                    log_success "XanMod ядро установлено. BBR2 будет активен после перезагрузки"
+                else
+                    log_warning "Не удалось установить XanMod. Используется BBR1"
+                fi
+            fi
+        fi
+
+        # Fallback на BBR1
+        if [ -z "$BBR_ALGO" ]; then
+            BBR_MODULE="tcp_bbr"
+            BBR_ALGO="bbr"
+            if ! grep -q "tcp_bbr" /proc/modules 2>/dev/null; then
+                modprobe tcp_bbr 2>/dev/null || true
+            fi
+            if lsmod | grep -q "tcp_bbr" 2>/dev/null; then
+                log_success "Модуль BBR1 загружен (fallback)"
+            else
+                log_warning "BBR1 может быть недоступен на этом ядре"
+            fi
+        fi
     fi
 
     log_info "Используется алгоритм: ${BBR_ALGO}"
@@ -2622,8 +2957,13 @@ main() {
 
     echo
 
-    # Открытие портов 443 и 80 в файерволе
-    ensure_firewall_ports
+    # Настройка UFW файервола
+    setup_ufw
+
+    echo
+
+    # Установка Fail2ban
+    install_fail2ban
 
     echo
 
@@ -2664,6 +3004,8 @@ show_help() {
     echo -e "${WHITE}Компоненты:${NC}"
     echo -e "  ${GREEN}●${NC} RemnawaveNode (Docker)     → ${GRAY}$REMNANODE_DIR${NC}"
     echo -e "  ${GREEN}●${NC} Caddy Selfsteal (Docker)   → ${GRAY}$CADDY_DIR${NC}"
+    echo -e "  ${GREEN}●${NC} UFW Firewall               → ${GRAY}deny all + whitelist${NC}"
+    echo -e "  ${GREEN}●${NC} Fail2ban                   → ${GRAY}SSH + Caddy + порт-сканы${NC}"
     echo -e "  ${GREEN}●${NC} Netbird VPN"
     echo -e "  ${GREEN}●${NC} Grafana мониторинг         → ${GRAY}/opt/monitoring${NC}"
     echo
@@ -2675,6 +3017,8 @@ show_help() {
     echo -e "  ${CYAN}CFG_CERT_TYPE${NC}=1              ${GRAY}# 1=обычный, 2=wildcard${NC}"
     echo -e "  ${CYAN}CFG_CADDY_PORT${NC}=9443          ${GRAY}# HTTPS порт Caddy${NC}"
     echo -e "  ${CYAN}CFG_INSTALL_NETBIRD${NC}=n         ${GRAY}# Установка Netbird (y/n)${NC}"
+    echo -e "  ${CYAN}CFG_SETUP_UFW${NC}=y               ${GRAY}# Настройка UFW (y/n)${NC}"
+    echo -e "  ${CYAN}CFG_INSTALL_FAIL2BAN${NC}=y        ${GRAY}# Установка Fail2ban (y/n)${NC}"
     echo -e "  ${CYAN}CFG_INSTALL_MONITORING${NC}=n      ${GRAY}# Установка мониторинга (y/n)${NC}"
     echo
     echo -e "${WHITE}Env переменные:${NC}"
@@ -2695,8 +3039,10 @@ uninstall_all() {
     echo "Будут удалены:"
     echo "  - RemnawaveNode ($REMNANODE_DIR)"
     echo "  - Caddy Selfsteal ($CADDY_DIR)"
+    echo "  - Fail2ban конфигурация (jail.local, фильтры)"
     echo "  - Мониторинг (/opt/monitoring)"
     echo "  - Данные Xray ($REMNANODE_DATA_DIR)"
+    echo "  - Логи RemnawaveNode (/var/log/remnanode)"
     echo
     echo -e "${YELLOW}Docker volumes (caddy_data, caddy_config) НЕ будут удалены.${NC}"
     echo -e "${YELLOW}Netbird НЕ будет удалён (используйте: apt remove netbird).${NC}"
@@ -2736,12 +3082,28 @@ uninstall_all() {
         log_success "Мониторинг остановлен"
     fi
 
+    # Остановка и удаление fail2ban конфигов
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        log_info "Остановка Fail2ban..."
+        systemctl stop fail2ban 2>/dev/null || true
+    fi
+    rm -f /etc/fail2ban/jail.local
+    rm -f /etc/fail2ban/filter.d/caddy-status.conf
+    rm -f /etc/fail2ban/filter.d/portscan.conf
+    systemctl stop portscan-detect 2>/dev/null || true
+    systemctl disable portscan-detect 2>/dev/null || true
+    rm -f /etc/systemd/system/portscan-detect.service
+
+    # Удаление logrotate конфига
+    rm -f /etc/logrotate.d/remnanode
+
     # Удаление директорий
     log_info "Удаление файлов..."
     rm -rf "$REMNANODE_DIR"
     rm -rf "$REMNANODE_DATA_DIR"
     rm -rf "$CADDY_DIR"
     rm -rf /opt/monitoring
+    rm -rf /var/log/remnanode
 
     echo
 
