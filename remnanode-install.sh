@@ -51,6 +51,11 @@ readonly CYAN='\033[0;36m'
 readonly WHITE='\033[1;37m'
 readonly GRAY='\033[0;37m'
 readonly NC='\033[0m'
+readonly BOLD='\033[1m'
+readonly DIM='\033[2m'
+
+# Версия скрипта
+readonly SCRIPT_VERSION="2.6.0"
 
 # Константы
 INSTALL_DIR="/opt"
@@ -377,9 +382,9 @@ load_config_file() {
 # Итоговое саммари установки
 show_installation_summary() {
     echo
-    echo -e "${GRAY}$(printf '═%.0s' $(seq 1 56))${NC}"
-    echo -e "${WHITE}  📋 Итоги установки${NC}"
-    echo -e "${GRAY}$(printf '═%.0s' $(seq 1 56))${NC}"
+    print_separator '═'
+    echo -e "${WHITE}${BOLD}  📋 Итоги установки${NC}"
+    print_separator '═'
     echo
 
     local -a components=("network:Сетевые настройки" "docker:Docker" "remnanode:RemnawaveNode" "caddy:Caddy Selfsteal" "ufw:UFW Firewall" "fail2ban:Fail2ban" "netbird:Netbird VPN" "monitoring:Мониторинг Grafana")
@@ -442,11 +447,311 @@ show_installation_summary() {
     fi
 
     echo
-    echo -e "${GRAY}$(printf '═%.0s' $(seq 1 56))${NC}"
+    print_separator '═'
     echo -e "${GRAY}  Сервер: $NODE_IP${NC}"
     echo -e "${GRAY}  Лог: $INSTALL_LOG${NC}"
-    echo -e "${GRAY}$(printf '═%.0s' $(seq 1 56))${NC}"
+    print_separator '═'
     echo
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  UI Helper функции
+# ═══════════════════════════════════════════════════════════════════
+
+# Горизонтальный разделитель стандартной ширины
+print_separator() {
+    local char="${1:-─}"
+    local width="${2:-56}"
+    echo -e "${GRAY}$(printf "${char}%.0s" $(seq 1 "$width"))${NC}"
+}
+
+# Стандартный заголовок секции
+print_header() {
+    local title="$1"
+    local emoji="${2:-}"
+    echo
+    print_separator '─'
+    if [ -n "$emoji" ]; then
+        echo -e "${WHITE}${BOLD}${emoji}  ${title}${NC}"
+    else
+        echo -e "${WHITE}${BOLD}  ${title}${NC}"
+    fi
+    print_separator '─'
+    echo
+}
+
+# Стартовый баннер
+print_banner() {
+    echo
+    echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}  ${WHITE}${BOLD}🚀 Remnawave Node Installer v${SCRIPT_VERSION}${NC}                    ${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}  ${GRAY}RemnawaveNode + Caddy Selfsteal${NC}                         ${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}  ${GRAY}Автоматический установщик для Linux${NC}                     ${CYAN}${BOLD}║${NC}"
+    echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
+    echo
+}
+
+# Проверка и отображение текущего состояния системы
+show_system_status() {
+    echo
+    print_separator '═'
+    echo -e "${WHITE}${BOLD}  📋 Состояние системы${NC}"
+    print_separator '═'
+    echo
+
+    # Системная информация
+    local os_name ip_addr disk_free ram_free ram_total
+    os_name=$(awk -F= '/^PRETTY_NAME=/{gsub(/"/, "", $2); print $2}' /etc/os-release 2>/dev/null || echo "Неизвестно")
+    ip_addr="${NODE_IP:-$(get_server_ip 2>/dev/null || echo '?')}"
+    disk_free=$(df -h /opt 2>/dev/null | awk 'NR==2 {print $4}' || echo "?")
+    ram_total=$(free -h 2>/dev/null | awk '/^Mem:/{print $2}' || echo "?")
+    ram_free=$(free -h 2>/dev/null | awk '/^Mem:/{print $7}' || echo "?")
+
+    echo -e "  ${GRAY}ОС:${NC}      ${WHITE}${os_name}${NC}"
+    echo -e "  ${GRAY}IP:${NC}      ${WHITE}${ip_addr}${NC}"
+    echo -e "  ${GRAY}Диск:${NC}    ${WHITE}${disk_free} свободно${NC}"
+    echo -e "  ${GRAY}RAM:${NC}     ${WHITE}${ram_free} / ${ram_total}${NC}"
+    echo
+    print_separator '─'
+    echo
+
+    # Docker
+    if command -v docker >/dev/null 2>&1; then
+        local docker_ver
+        docker_ver=$(docker --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "?")
+        if systemctl is-active --quiet docker 2>/dev/null; then
+            printf "  ✅  ${GRAY}%-24s${NC} ${GREEN}%s${NC}\n" "Docker" "запущен v${docker_ver}"
+        else
+            printf "  ⚠️   ${GRAY}%-24s${NC} ${YELLOW}%s${NC}\n" "Docker" "установлен, не запущен"
+        fi
+    else
+        printf "  ⭕  ${GRAY}%-24s${NC} ${GRAY}%s${NC}\n" "Docker" "не установлен"
+    fi
+
+    # RemnawaveNode
+    if check_existing_remnanode 2>/dev/null; then
+        if command -v docker >/dev/null 2>&1 && docker compose --project-directory "$REMNANODE_DIR" ps 2>/dev/null | grep -qE "Up|running"; then
+            printf "  ✅  ${GRAY}%-24s${NC} ${GREEN}%s${NC}\n" "RemnawaveNode" "запущен"
+        else
+            printf "  ⚠️   ${GRAY}%-24s${NC} ${YELLOW}%s${NC}\n" "RemnawaveNode" "установлен, остановлен"
+        fi
+    else
+        printf "  ⭕  ${GRAY}%-24s${NC} ${GRAY}%s${NC}\n" "RemnawaveNode" "не установлен"
+    fi
+
+    # Caddy
+    if check_existing_caddy 2>/dev/null; then
+        if command -v docker >/dev/null 2>&1 && docker compose --project-directory "$CADDY_DIR" ps 2>/dev/null | grep -qE "Up|running"; then
+            printf "  ✅  ${GRAY}%-24s${NC} ${GREEN}%s${NC}\n" "Caddy Selfsteal" "запущен"
+        else
+            printf "  ⚠️   ${GRAY}%-24s${NC} ${YELLOW}%s${NC}\n" "Caddy Selfsteal" "установлен, остановлен"
+        fi
+    else
+        printf "  ⭕  ${GRAY}%-24s${NC} ${GRAY}%s${NC}\n" "Caddy Selfsteal" "не установлен"
+    fi
+
+    # UFW
+    if command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -qi "active"; then
+            printf "  ✅  ${GRAY}%-24s${NC} ${GREEN}%s${NC}\n" "UFW Firewall" "активен"
+        else
+            printf "  ⚠️   ${GRAY}%-24s${NC} ${YELLOW}%s${NC}\n" "UFW Firewall" "установлен, неактивен"
+        fi
+    else
+        printf "  ⭕  ${GRAY}%-24s${NC} ${GRAY}%s${NC}\n" "UFW Firewall" "не установлен"
+    fi
+
+    # Fail2ban
+    if command -v fail2ban-client >/dev/null 2>&1; then
+        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+            printf "  ✅  ${GRAY}%-24s${NC} ${GREEN}%s${NC}\n" "Fail2ban" "активен"
+        else
+            printf "  ⚠️   ${GRAY}%-24s${NC} ${YELLOW}%s${NC}\n" "Fail2ban" "установлен, не запущен"
+        fi
+    else
+        printf "  ⭕  ${GRAY}%-24s${NC} ${GRAY}%s${NC}\n" "Fail2ban" "не установлен"
+    fi
+
+    # Netbird
+    if check_existing_netbird 2>/dev/null; then
+        if netbird status 2>/dev/null | grep -qi "connected"; then
+            printf "  ✅  ${GRAY}%-24s${NC} ${GREEN}%s${NC}\n" "Netbird VPN" "подключен"
+        else
+            printf "  ⚠️   ${GRAY}%-24s${NC} ${YELLOW}%s${NC}\n" "Netbird VPN" "установлен, не подключен"
+        fi
+    else
+        printf "  ⭕  ${GRAY}%-24s${NC} ${GRAY}%s${NC}\n" "Netbird VPN" "не установлен"
+    fi
+
+    # Мониторинг
+    if check_existing_monitoring 2>/dev/null; then
+        if systemctl is-active --quiet vmagent 2>/dev/null; then
+            printf "  ✅  ${GRAY}%-24s${NC} ${GREEN}%s${NC}\n" "Grafana мониторинг" "запущен"
+        else
+            printf "  ⚠️   ${GRAY}%-24s${NC} ${YELLOW}%s${NC}\n" "Grafana мониторинг" "установлен, остановлен"
+        fi
+    else
+        printf "  ⭕  ${GRAY}%-24s${NC} ${GRAY}%s${NC}\n" "Grafana мониторинг" "не установлен"
+    fi
+
+    echo
+    print_separator '═'
+    echo
+}
+
+# Главное меню (интерактивный режим)
+show_main_menu() {
+    print_separator '─'
+    echo -e "${WHITE}${BOLD}  Выберите действие:${NC}"
+    print_separator '─'
+    echo
+    echo -e "   ${CYAN}1)${NC} ${WHITE}🚀 Установить всё${NC}              ${GRAY}(полная установка)${NC}"
+    echo -e "   ${CYAN}2)${NC} ${WHITE}📦 Выборочная установка${NC}        ${GRAY}(выбрать компоненты)${NC}"
+    echo -e "   ${CYAN}3)${NC} ${WHITE}📋 Проверить статус${NC}            ${GRAY}(текущее состояние)${NC}"
+    echo -e "   ${CYAN}4)${NC} ${WHITE}🗑️  Удалить всё${NC}                ${GRAY}(полное удаление)${NC}"
+    echo -e "   ${CYAN}5)${NC} ${WHITE}❓ Справка${NC}                     ${GRAY}(--help)${NC}"
+    echo
+    print_separator '─'
+    echo
+
+    local menu_choice
+    prompt_choice "Введите номер [1-5]: " 5 menu_choice
+
+    case "$menu_choice" in
+        1) run_full_install ;;
+        2) run_selective_install ;;
+        3) show_system_status; show_main_menu ;;
+        4) uninstall_all ;;
+        5) show_help; show_main_menu ;;
+    esac
+}
+
+# Выборочная установка — выбор компонентов
+run_selective_install() {
+    print_header "Выборочная установка" "📦"
+    echo -e "${GRAY}  Выберите компоненты для установки.${NC}"
+    echo -e "${GRAY}  Введите номера через пробел (например: 1 3 5)${NC}"
+    echo -e "${GRAY}  или нажмите ENTER для выбора всех.${NC}"
+    echo
+    echo -e "   ${CYAN}1)${NC} 🌐 Сетевые настройки      ${GRAY}(BBR, TCP tuning)${NC}"
+    echo -e "   ${CYAN}2)${NC} 🐳 Docker                  ${GRAY}(обязателен для 3 и 4)${NC}"
+    echo -e "   ${CYAN}3)${NC} 📦 RemnawaveNode           ${GRAY}(требует Docker)${NC}"
+    echo -e "   ${CYAN}4)${NC} 🔒 Caddy Selfsteal         ${GRAY}(требует Docker)${NC}"
+    echo -e "   ${CYAN}5)${NC} 🛡️  UFW Firewall${NC}"
+    echo -e "   ${CYAN}6)${NC} 🛡️  Fail2ban${NC}"
+    echo -e "   ${CYAN}7)${NC} 🌐 Netbird VPN${NC}"
+    echo -e "   ${CYAN}8)${NC} 📊 Grafana мониторинг${NC}"
+    echo
+
+    local selection_raw
+    if [ "${NON_INTERACTIVE:-false}" = true ]; then
+        selection_raw="1 2 3 4 5 6 7 8"
+    else
+        read -p "Ваш выбор [1-8, ENTER=все]: " -r selection_raw
+        if [ -z "$selection_raw" ]; then
+            selection_raw="1 2 3 4 5 6 7 8"
+        fi
+    fi
+
+    # Валидация
+    local -a chosen=()
+    for token in $selection_raw; do
+        if [[ "$token" =~ ^[1-8]$ ]]; then
+            chosen+=("$token")
+        else
+            log_warning "Неверный номер '$token' — пропущен"
+        fi
+    done
+
+    if [ ${#chosen[@]} -eq 0 ]; then
+        log_error "Не выбрано ни одного компонента."
+        return 1
+    fi
+
+    # Автодобавление Docker если выбран Remnanode/Caddy
+    local need_docker=false
+    for c in "${chosen[@]}"; do
+        [[ "$c" == "3" || "$c" == "4" ]] && need_docker=true
+    done
+    if [ "$need_docker" = true ]; then
+        local has_docker=false
+        for c in "${chosen[@]}"; do [ "$c" = "2" ] && has_docker=true; done
+        if [ "$has_docker" = false ] && ! command -v docker >/dev/null 2>&1; then
+            log_warning "RemnawaveNode/Caddy требуют Docker. Docker добавлен автоматически."
+            chosen=("2" "${chosen[@]}")
+        fi
+    fi
+
+    echo
+    log_info "Выбранные компоненты: ${chosen[*]}"
+    echo
+
+    # Общие подготовительные шаги (если ещё не выполнены)
+    if [ -z "${NODE_IP:-}" ]; then
+        NODE_IP=$(get_server_ip)
+    fi
+    if [ -z "${OS:-}" ]; then
+        detect_os
+        detect_package_manager
+    fi
+
+    if ! check_disk_space 500 "/opt"; then
+        if ! prompt_yn "Недостаточно места. Продолжить? (y/n): " "n"; then
+            return 1
+        fi
+    fi
+
+    ensure_package_manager_available
+    _RESTORE_AUTO_UPDATES=true
+
+    # Установка curl/wget если нужны
+    if ! command -v curl >/dev/null 2>&1; then
+        install_package curl || { log_error "Не удалось установить curl"; return 1; }
+    fi
+    if ! command -v wget >/dev/null 2>&1; then
+        install_package wget || { log_error "Не удалось установить wget"; return 1; }
+    fi
+
+    # Автоопределение версий
+    local new_cadvisor new_node_exporter new_vmagent
+    new_cadvisor=$(fetch_latest_version "google/cadvisor" "$CADVISOR_VERSION")
+    new_node_exporter=$(fetch_latest_version "prometheus/node_exporter" "$NODE_EXPORTER_VERSION")
+    new_vmagent=$(fetch_latest_version "VictoriaMetrics/VictoriaMetrics" "$VMAGENT_VERSION")
+    [ -n "$new_cadvisor" ] && CADVISOR_VERSION="$new_cadvisor"
+    [ -n "$new_node_exporter" ] && NODE_EXPORTER_VERSION="$new_node_exporter"
+    [ -n "$new_vmagent" ] && VMAGENT_VERSION="$new_vmagent"
+
+    # Выполнение в фиксированном порядке зависимостей
+    for c in 1 2 3 4 5 6 7 8; do
+        local selected=false
+        for x in "${chosen[@]}"; do [ "$x" = "$c" ] && selected=true; done
+        [ "$selected" = false ] && continue
+
+        case "$c" in
+            1) apply_network_settings ;;
+            2)
+                if ! install_docker; then
+                    log_error "Не удалось установить Docker"
+                    STATUS_DOCKER="ошибка"
+                    continue
+                fi
+                STATUS_DOCKER="установлен"
+                check_docker_compose
+                ;;
+            3) install_remnanode ;;
+            4) install_caddy_selfsteal ;;
+            5) setup_ufw ;;
+            6) install_fail2ban ;;
+            7) install_netbird ;;
+            8) install_grafana_monitoring ;;
+        esac
+        echo
+    done
+
+    restore_auto_updates
+    _RESTORE_AUTO_UPDATES=false
+    show_installation_summary
+    log_success "Выборочная установка завершена."
 }
 
 # Проверка root
@@ -913,10 +1218,7 @@ check_docker_compose() {
 
 # Полная настройка UFW файервола
 setup_ufw() {
-    echo
-    echo -e "${WHITE}🛡️  Настройка UFW Firewall${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
-    echo
+    print_header "Настройка UFW Firewall" "🛡️"
 
     if ! prompt_yn "Настроить UFW файервол (default deny + whitelist портов)? (y/n): " "y" "$CFG_SETUP_UFW"; then
         log_info "Настройка UFW пропущена"
@@ -970,10 +1272,7 @@ setup_ufw() {
 
 # Установка и настройка Fail2ban
 install_fail2ban() {
-    echo
-    echo -e "${WHITE}🛡️  Установка Fail2ban${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
-    echo
+    print_header "Установка Fail2ban" "🛡️"
 
     if ! prompt_yn "Установить Fail2ban (защита SSH, Caddy, порт-сканы)? (y/n): " "y" "$CFG_INSTALL_FAIL2BAN"; then
         log_info "Установка Fail2ban пропущена"
@@ -2111,9 +2410,9 @@ EOF
 
     # Вывод итоговой информации
     echo
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
-    echo -e "${WHITE}🎉 Установка завершена успешно!${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
+    print_separator
+    echo -e "${WHITE}${BOLD}🎉 Установка завершена успешно!${NC}"
+    print_separator
     echo
     echo -e "${WHITE}📋 Конфигурация Xray Reality:${NC}"
     if [ "$USE_WILDCARD" = true ]; then
@@ -2160,10 +2459,7 @@ check_existing_netbird() {
 
 # Установка Netbird
 install_netbird() {
-    echo
-    echo -e "${WHITE}🌐 Установка Netbird VPN${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
-    echo
+    print_header "Установка Netbird VPN" "🌐"
 
     if ! prompt_yn "Установить Netbird VPN? (y/n): " "n" "$CFG_INSTALL_NETBIRD"; then
         log_info "Установка Netbird пропущена"
@@ -2319,10 +2615,7 @@ check_existing_monitoring() {
 
 # Установка мониторинга Grafana
 install_grafana_monitoring() {
-    echo
-    echo -e "${WHITE}📊 Установка мониторинга Grafana${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
-    echo
+    print_header "Установка мониторинга Grafana" "📊"
     
     if ! prompt_yn "Установить мониторинг Grafana (cadvisor, node_exporter, vmagent)? (y/n): " "n" "$CFG_INSTALL_MONITORING"; then
         log_info "Установка мониторинга пропущена"
@@ -2613,10 +2906,7 @@ EOF
 
 # Применение сетевых настроек
 apply_network_settings() {
-    echo
-    echo -e "${WHITE}🌐 Оптимизация сетевых настроек${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 40))${NC}"
-    echo
+    print_header "Оптимизация сетевых настроек" "🌐"
 
     if ! prompt_yn "Применить оптимизацию сетевых настроек (BBR, TCP tuning, лимиты)? (y/n): " "y" "$CFG_APPLY_NETWORK"; then
         log_info "Оптимизация сетевых настроек пропущена"
@@ -2826,26 +3116,22 @@ EOF
 }
 
 # Главная функция
-main() {
-    echo
-    echo -e "${WHITE}🚀 Установка RemnawaveNode + Caddy Selfsteal${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
-    echo
+run_full_install() {
+    print_header "Полная установка RemnawaveNode + Caddy" "🚀"
 
-    # Проверка root
+    # Проверка root (идемпотентна, safe для повторного вызова)
     check_root
 
-    # Загрузка конфиг-файла для non-interactive режима
-    if [ -f "$CONFIG_FILE" ]; then
-        load_config_file "$CONFIG_FILE"
+    # Получение IP сервера
+    if [ -z "${NODE_IP:-}" ]; then
+        NODE_IP=$(get_server_ip)
     fi
 
-    # Получение IP сервера (после check_root)
-    NODE_IP=$(get_server_ip)
-
-    # Определение ОС
-    detect_os
-    detect_package_manager
+    # Определение ОС (если ещё не определена)
+    if [ -z "${OS:-}" ]; then
+        detect_os
+        detect_package_manager
+    fi
 
     log_info "Обнаружена ОС: $OS"
     log_info "IP сервера: $NODE_IP"
@@ -2987,19 +3273,41 @@ main() {
     log_success "Всё готово! Установка завершена."
 }
 
+# Точка входа
+main() {
+    # Загрузка конфиг-файла (может установить NON_INTERACTIVE=true)
+    if [ -f "$CONFIG_FILE" ] && [ "${NON_INTERACTIVE:-false}" != true ]; then
+        load_config_file "$CONFIG_FILE"
+    fi
+
+    # Non-interactive: пропустить меню, запустить полную установку
+    if [ "${NON_INTERACTIVE:-false}" = true ]; then
+        run_full_install
+        return
+    fi
+
+    # Интерактивный режим: баннер → статус → меню
+    check_root
+    NODE_IP=$(get_server_ip)
+    detect_os
+    detect_package_manager
+
+    print_banner
+    show_system_status
+    show_main_menu
+}
+
 # Вывод справки
 show_help() {
-    echo
-    echo -e "${WHITE}🚀 Remnawave Node Installer${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
-    echo
+    print_header "Remnawave Node Installer v${SCRIPT_VERSION}" "🚀"
     echo -e "${WHITE}Использование:${NC} $(basename "$0") ${CYAN}[ОПЦИЯ]${NC}"
     echo
     echo -e "${WHITE}Опции:${NC}"
     echo -e "  ${CYAN}--help${NC}          Показать эту справку"
+    echo -e "  ${CYAN}--status${NC}        Показать статус системы"
     echo -e "  ${CYAN}--uninstall${NC}     Удалить все компоненты"
     echo -e "  ${CYAN}--config FILE${NC}   Использовать конфиг-файл (non-interactive режим)"
-    echo -e "  ${GRAY}(без опций)${NC}     Запустить интерактивную установку"
+    echo -e "  ${GRAY}(без опций)${NC}     Показать главное меню"
     echo
     echo -e "${WHITE}Компоненты:${NC}"
     echo -e "  ${GREEN}●${NC} RemnawaveNode (Docker)     → ${GRAY}$REMNANODE_DIR${NC}"
@@ -3033,8 +3341,8 @@ show_help() {
 uninstall_all() {
     check_root
 
-    echo -e "${RED}⚠️  Удаление всех компонентов Remnawave${NC}"
-    echo -e "${GRAY}$(printf '─%.0s' $(seq 1 50))${NC}"
+    echo -e "${RED}${BOLD}⚠️  Удаление всех компонентов Remnawave${NC}"
+    print_separator
     echo
     echo "Будут удалены:"
     echo "  - RemnawaveNode ($REMNANODE_DIR)"
@@ -3142,6 +3450,15 @@ uninstall_all() {
 case "${1:-}" in
     --help|-h)
         show_help
+        exit 0
+        ;;
+    --status)
+        check_root
+        NODE_IP=$(get_server_ip)
+        detect_os
+        detect_package_manager
+        print_banner
+        show_system_status
         exit 0
         ;;
     --uninstall)
