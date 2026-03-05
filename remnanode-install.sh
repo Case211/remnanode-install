@@ -2686,11 +2686,6 @@ install_grafana_monitoring() {
 
     log_info "Обнаружена архитектура: $ARCH"
     
-    # Создание пользователя для мониторинга (node_exporter и vmagent не требуют root)
-    if ! id -u monitoring >/dev/null 2>&1; then
-        useradd --system --no-create-home --shell /usr/sbin/nologin monitoring 2>/dev/null || true
-    fi
-
     # Создание директорий
     mkdir -p /opt/monitoring/{cadvisor,nodeexporter,vmagent}
     
@@ -2818,7 +2813,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
     
-    # Node Exporter service (не требует root)
+    # Node Exporter service
     cat > /etc/systemd/system/nodeexporter.service << EOF
 [Unit]
 Description=Node Exporter
@@ -2826,8 +2821,8 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-User=monitoring
-Group=monitoring
+User=root
+Group=root
 Type=simple
 ExecStart=/opt/monitoring/nodeexporter/node_exporter --web.listen-address=127.0.0.1:9100
 Restart=always
@@ -2838,9 +2833,6 @@ WantedBy=multi-user.target
 EOF
     
     # VictoriaMetrics Agent service
-    # VictoriaMetrics Agent service (не требует root)
-    chown -R monitoring:monitoring /opt/monitoring/vmagent
-    chown -R monitoring:monitoring /opt/monitoring/nodeexporter
     cat > /etc/systemd/system/vmagent.service << EOF
 [Unit]
 Description=VictoriaMetrics Agent
@@ -2848,8 +2840,8 @@ Wants=network-online.target
 After=network-online.target
 
 [Service]
-User=monitoring
-Group=monitoring
+User=root
+Group=root
 Type=simple
 ExecStart=/opt/monitoring/vmagent/vmagent \\
       -httpListenAddr=127.0.0.1:8429 \\
