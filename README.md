@@ -56,45 +56,53 @@
 
 ## 🚀 Быстрый старт
 
-### 1. Скачайте скрипт
+### Установка одной командой
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Case211/remnanode-install/refs/heads/main/remnanode-install.sh)
+```
+
+### Альтернативные способы
+
+<details>
+<summary>Скачать и запустить вручную</summary>
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Case211/remnanode-install/refs/heads/main/remnanode-install.sh -o remnanode-install.sh
-```
-
-Или клонируйте репозиторий:
-
-```bash
-git clone https://github.com/Case211/remnanode-install.git
-```
-
-```bash
-cd remnanode-install
-```
-
-### 2. Запустите скрипт
-
-```bash
 chmod +x remnanode-install.sh
-```
-
-#### Интерактивный режим (по умолчанию):
-
-```bash
 sudo ./remnanode-install.sh
 ```
 
-#### Non-interactive режим (с конфиг-файлом):
+</details>
+
+<details>
+<summary>Клонировать репозиторий</summary>
 
 ```bash
-sudo ./remnanode-install.sh --config /path/to/config
+git clone https://github.com/Case211/remnanode-install.git
+cd remnanode-install
+chmod +x remnanode-install.sh
+sudo ./remnanode-install.sh
 ```
 
-#### Через env переменные:
+</details>
+
+<details>
+<summary>Non-interactive режим</summary>
+
+С конфиг-файлом:
 
 ```bash
-sudo NON_INTERACTIVE=true CFG_SECRET_KEY="..." CFG_DOMAIN="example.com" ./remnanode-install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Case211/remnanode-install/refs/heads/main/remnanode-install.sh) --config /path/to/config
 ```
+
+Через env переменные:
+
+```bash
+sudo NON_INTERACTIVE=true CFG_SECRET_KEY="..." CFG_DOMAIN="example.com" bash <(curl -fsSL https://raw.githubusercontent.com/Case211/remnanode-install/refs/heads/main/remnanode-install.sh)
+```
+
+</details>
 
 ## 🤖 Non-interactive режим
 
