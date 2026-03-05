@@ -1635,7 +1635,7 @@ EOF
     
     # Запуск контейнера
     log_info "Запуск RemnawaveNode..."
-    docker compose --project-directory "$REMNANODE_DIR" up -d
+    cd "$REMNANODE_DIR" && docker compose up -d; cd - > /dev/null
 
     # Проверка что контейнер поднялся (с ожиданием до 30 сек)
     log_info "Ожидание запуска контейнера..."
@@ -2406,7 +2406,7 @@ EOF
 
     # Запуск Caddy
     log_info "Запуск Caddy..."
-    docker compose --project-directory "$CADDY_DIR" up -d
+    cd "$CADDY_DIR" && docker compose up -d; cd - > /dev/null
 
     # Проверка что контейнер поднялся (с ожиданием до 30 сек)
     log_info "Ожидание запуска контейнера..."
