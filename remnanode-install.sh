@@ -2335,6 +2335,11 @@ http://{\$SELF_STEAL_DOMAIN} {
 }
 
 https://{\$SELF_STEAL_DOMAIN} {
+	tls {
+		issuer acme {
+			disable_tlsalpn_challenge
+		}
+	}
 	root * /var/www/html
 	try_files {path} /index.html
 	file_server
@@ -2681,7 +2686,7 @@ install_grafana_monitoring() {
     fi
 
     # Создание директорий
-    mkdir -p /opt/monitoring/{cadvisor,nodeexporter,vmagent/conf.d}
+    mkdir -p /opt/monitoring/{cadvisor,nodeexporter,vmagent}
     
     # Установка cadvisor
     log_info "Установка cAdvisor v${CADVISOR_VERSION}..."
@@ -2764,28 +2769,19 @@ install_grafana_monitoring() {
     cat > /opt/monitoring/vmagent/scrape.yml << EOF
 global:
   scrape_interval: 15s
-scrape_config_files:
-  - "/opt/monitoring/vmagent/conf.d/*.yml"
-EOF
-    
-    # Конфигурация cadvisor
-    cat > /opt/monitoring/vmagent/conf.d/cadvisor.yml << EOF
-- job_name: integrations/cAdvisor
-  scrape_interval: 15s
-  static_configs:
-    - targets: ['localhost:9101']
-      labels:
-        instance: "$instance_name"
-EOF
-    
-    # Конфигурация node_exporter
-    cat > /opt/monitoring/vmagent/conf.d/nodeexporter.yml << EOF
-- job_name: integrations/node_exporter
-  scrape_interval: 15s
-  static_configs:
-    - targets: ['localhost:9100']
-      labels:
-        instance: "$instance_name"
+scrape_configs:
+  - job_name: integrations/cAdvisor
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['localhost:9101']
+        labels:
+          instance: "$instance_name"
+  - job_name: integrations/node_exporter
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['localhost:9100']
+        labels:
+          instance: "$instance_name"
 EOF
     
     log_success "Конфигурационные файлы созданы"
