@@ -1313,16 +1313,18 @@ install_fail2ban() {
     # Создание директории для логов remnanode (для будущих фильтров)
     mkdir -p /var/log/remnanode
 
-    # Создание кастомного фильтра для Caddy (JSON логи)
+    # Создание кастомного фильтра для Caddy (JSON логи) — только если Caddy установлен
     log_info "Создание фильтров Fail2ban..."
 
-    cat > /etc/fail2ban/filter.d/caddy-status.conf << 'EOF'
+    if [ -f /opt/caddy/logs/access.log ] || [ -d /opt/caddy ]; then
+        cat > /etc/fail2ban/filter.d/caddy-status.conf << 'EOF'
 [Definition]
 # Детект подозрительных запросов к Caddy из JSON access.log
 # Ловим 4xx ошибки (сканеры, брутфорс путей)
 failregex = "client_ip":"<HOST>".*"status":(401|403|404|405|444)
 ignoreregex =
 EOF
+    fi
 
     # Создание фильтра для порт-сканирования (через iptables LOG)
     cat > /etc/fail2ban/filter.d/portscan.conf << 'EOF'
@@ -1385,6 +1387,16 @@ backend = systemd
 maxretry = 5
 findtime = 600
 bantime = 3600
+EOF
+
+    # Добавление Caddy jail только если Caddy установлен и лог-директория существует
+    if [ -f /opt/caddy/logs/access.log ] || [ -d /opt/caddy ]; then
+        # Создаём лог-файл если директория есть но файл ещё не создан
+        if [ -d /opt/caddy ] && [ ! -f /opt/caddy/logs/access.log ]; then
+            mkdir -p /opt/caddy/logs
+            touch /opt/caddy/logs/access.log
+        fi
+        cat >> /etc/fail2ban/jail.local << 'EOF'
 
 # ── Caddy — подозрительные запросы (сканеры, 4xx) ────────────────
 [caddy-status]
@@ -1395,16 +1407,36 @@ logpath = /opt/caddy/logs/access.log
 maxretry = 15
 findtime = 600
 bantime = 3600
+EOF
+        log_info "Caddy jail включён"
+    else
+        log_info "Caddy не обнаружен — caddy-status jail пропущен"
+    fi
+
+    # Добавление portscan jail только если лог-файл существует
+    local portscan_log=""
+    if [ -f /var/log/kern.log ]; then
+        portscan_log="/var/log/kern.log"
+    elif [ -f /var/log/syslog ]; then
+        portscan_log="/var/log/syslog"
+    fi
+
+    if [ -n "$portscan_log" ]; then
+        cat >> /etc/fail2ban/jail.local << EOF
 
 # ── Детект порт-сканирования ─────────────────────────────────────
 [portscan]
 enabled = true
 filter = portscan
-logpath = /var/log/kern.log
+logpath = $portscan_log
 maxretry = 3
 findtime = 300
 bantime = 86400
 EOF
+        log_info "Portscan jail включён (лог: $portscan_log)"
+    else
+        log_info "Лог ядра не найден — portscan jail пропущен"
+    fi
 
     log_success "jail.local создан"
 
@@ -1432,8 +1464,12 @@ EOF
     echo
     echo -e "${WHITE}📋 Конфигурация Fail2ban:${NC}"
     echo -e "${GRAY}   SSH: maxretry=5, bantime=1ч${NC}"
-    echo -e "${GRAY}   Caddy: maxretry=15, bantime=1ч${NC}"
-    echo -e "${GRAY}   Порт-сканы: maxretry=3, bantime=24ч${NC}"
+    if [ -f /opt/caddy/logs/access.log ] || [ -d /opt/caddy ]; then
+        echo -e "${GRAY}   Caddy: maxretry=15, bantime=1ч${NC}"
+    fi
+    if [ -n "$portscan_log" ]; then
+        echo -e "${GRAY}   Порт-сканы: maxretry=3, bantime=24ч${NC}"
+    fi
     echo -e "${GRAY}   Конфиг: /etc/fail2ban/jail.local${NC}"
     echo
 }
