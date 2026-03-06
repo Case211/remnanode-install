@@ -3405,6 +3405,16 @@ show_help() {
 }
 
 # ═══════════════════════════════════════════════════════════════════
+#  Общая инициализация для CLI-команд
+# ═══════════════════════════════════════════════════════════════════
+_init_env() {
+    check_root
+    NODE_IP=$(get_server_ip)
+    detect_os
+    detect_package_manager
+}
+
+# ═══════════════════════════════════════════════════════════════════
 #  Список доступных SNI шаблонов
 # ═══════════════════════════════════════════════════════════════════
 TEMPLATES=(
@@ -3483,10 +3493,7 @@ change_template() {
 #  --update: обновление компонентов без изменения конфигов
 # ═══════════════════════════════════════════════════════════════════
 update_components() {
-    check_root
-    NODE_IP=$(get_server_ip)
-    detect_os
-    detect_package_manager
+    _init_env
 
     print_header "Обновление компонентов" "🔄"
 
@@ -3619,10 +3626,7 @@ _update_monitoring() {
 #  --diagnose: диагностика всех компонентов
 # ═══════════════════════════════════════════════════════════════════
 run_diagnose() {
-    check_root
-    NODE_IP=$(get_server_ip)
-    detect_os
-    detect_package_manager
+    _init_env
 
     print_header "Диагностика системы" "🩺"
 
@@ -3769,7 +3773,7 @@ run_diagnose() {
 
     # 7. Мониторинг
     echo -e "${WHITE}[7/7] Мониторинг${NC}"
-    local mon_ok=0 mon_total=0
+    local mon_ok=0
     for svc in cadvisor nodeexporter vmagent; do
         if systemctl is-active --quiet "$svc" 2>/dev/null; then
             log_success "$svc запущен"
@@ -3778,7 +3782,6 @@ run_diagnose() {
             log_error "$svc не запущен"
             issues=$((issues + 1))
         fi
-        mon_total=$((mon_total + 1))
     done
     if [ $mon_ok -eq 0 ] && [ ! -d "/opt/monitoring" ]; then
         log_info "Мониторинг не установлен"
@@ -3807,16 +3810,34 @@ self_update() {
 
     log_info "Проверка обновлений скрипта..."
 
-    # Получаем версию с GitHub
+    # Скачиваем один раз во временный файл
+    local tmp_script
+    tmp_script=$(mktemp)
+    if ! curl -fsSL --connect-timeout 10 "$script_url" -o "$tmp_script" 2>/dev/null; then
+        rm -f "$tmp_script"
+        log_error "Не удалось скачать скрипт с GitHub"
+        return 1
+    fi
+
+    # Проверяем что скачанный файл валиден
+    if ! head -1 "$tmp_script" | grep -q "^#!/"; then
+        rm -f "$tmp_script"
+        log_error "Скачанный файл невалиден"
+        return 1
+    fi
+
+    # Извлекаем версию из скачанного файла
     local remote_version
-    remote_version=$(curl -fsSL --connect-timeout 10 "$script_url" 2>/dev/null | grep -oP 'SCRIPT_VERSION="\K[^"]+' | head -1)
+    remote_version=$(grep -oP 'SCRIPT_VERSION="\K[^"]+' "$tmp_script" | head -1)
 
     if [ -z "$remote_version" ]; then
-        log_error "Не удалось получить версию с GitHub"
+        rm -f "$tmp_script"
+        log_error "Не удалось определить версию скачанного скрипта"
         return 1
     fi
 
     if [ "$remote_version" = "$SCRIPT_VERSION" ]; then
+        rm -f "$tmp_script"
         log_success "Установлена последняя версия: v${SCRIPT_VERSION}"
         return 0
     fi
@@ -3824,41 +3845,24 @@ self_update() {
     log_info "Доступна новая версия: v${remote_version} (текущая: v${SCRIPT_VERSION})"
 
     if ! prompt_yn "Обновить скрипт? (y/n): " "y"; then
+        rm -f "$tmp_script"
         log_info "Обновление отменено"
         return 0
     fi
 
-    # Скачиваем новую версию
-    local tmp_script
-    tmp_script=$(mktemp)
-    if curl -fsSL "$script_url" -o "$tmp_script" 2>/dev/null; then
-        chmod +x "$tmp_script"
-        # Проверяем что скачанный файл валиден
-        if head -1 "$tmp_script" | grep -q "^#!/"; then
-            cp "$tmp_script" "$script_path"
-            rm -f "$tmp_script"
-            log_success "Скрипт обновлён до v${remote_version}"
-            log_info "Перезапустите скрипт для использования новой версии"
-        else
-            rm -f "$tmp_script"
-            log_error "Скачанный файл невалиден"
-            return 1
-        fi
-    else
-        rm -f "$tmp_script"
-        log_error "Не удалось скачать обновление"
-        return 1
-    fi
+    # Заменяем текущий скрипт скачанным
+    chmod +x "$tmp_script"
+    cp "$tmp_script" "$script_path"
+    rm -f "$tmp_script"
+    log_success "Скрипт обновлён до v${remote_version}"
+    log_info "Перезапустите скрипт для использования новой версии"
 }
 
 # ═══════════════════════════════════════════════════════════════════
 #  --dry-run: показать план без выполнения
 # ═══════════════════════════════════════════════════════════════════
 dry_run() {
-    check_root
-    NODE_IP=$(get_server_ip)
-    detect_os
-    detect_package_manager
+    _init_env
 
     print_header "Dry Run — план установки" "📋"
 
@@ -3967,14 +3971,14 @@ export_config() {
     # RemnawaveNode
     if [ -f "$REMNANODE_DIR/.env" ]; then
         cfg_secret=$(grep "^SECRET_KEY=" "$REMNANODE_DIR/.env" 2>/dev/null | cut -d= -f2-)
-        cfg_port=$(grep "^NODE_PORT=" "$REMNANODE_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "3000")
+        cfg_port=$(grep "^NODE_PORT=" "$REMNANODE_DIR/.env" 2>/dev/null | cut -d= -f2- || echo "3000")
     fi
 
     # Caddy
     if [ -f "$CADDY_DIR/.env" ]; then
-        cfg_domain=$(grep "^SELF_STEAL_DOMAIN=" "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2)
-        cfg_caddy_port=$(grep "^SELF_STEAL_PORT=" "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "9443")
-        cfg_cf_token=$(grep "^CLOUDFLARE_API_TOKEN=" "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2)
+        cfg_domain=$(grep "^SELF_STEAL_DOMAIN=" "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2-)
+        cfg_caddy_port=$(grep "^SELF_STEAL_PORT=" "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2- || echo "9443")
+        cfg_cf_token=$(grep "^CLOUDFLARE_API_TOKEN=" "$CADDY_DIR/.env" 2>/dev/null | cut -d= -f2-)
         if [ -n "$cfg_cf_token" ]; then
             cfg_cert_type="2"
         fi
@@ -4032,6 +4036,9 @@ EOF
 
     chmod 600 "$output"
     log_success "Конфигурация экспортирована в $output"
+    if [ -n "$cfg_secret" ]; then
+        log_warning "Конфиг содержит SECRET_KEY — храните файл в безопасности!"
+    fi
     echo
     echo -e "${GRAY}  Используйте для деплоя на новом сервере:${NC}"
     echo -e "${CYAN}  scp $output root@<new-server>:/etc/remnanode-install.conf${NC}"
@@ -4155,10 +4162,7 @@ case "${1:-}" in
         exit 0
         ;;
     --status)
-        check_root
-        NODE_IP=$(get_server_ip)
-        detect_os
-        detect_package_manager
+        _init_env
         print_banner
         show_system_status
         exit 0
