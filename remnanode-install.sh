@@ -2015,8 +2015,8 @@ download_template() {
 
     # Попытка загрузки через git (в подоболочке чтобы не менять рабочую директорию)
     if command -v git >/dev/null 2>&1; then
-        local temp_dir="/tmp/selfsteal-template-$$"
-        mkdir -p "$temp_dir"
+        local temp_dir
+        temp_dir=$(mktemp -d) || { log_error "Не удалось создать временную директорию"; return 1; }
 
         if git clone --filter=blob:none --sparse "https://github.com/Case211/remnanode-install.git" "$temp_dir" 2>/dev/null; then
             (
@@ -2225,7 +2225,7 @@ install_caddy_selfsteal() {
             read -p "Введите домен (например, reality.example.com): " original_domain
             if [ -z "$original_domain" ]; then
                 log_error "Домен не может быть пустым!"
-            elif ! [[ "$original_domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || ! [[ "$original_domain" == *.* ]]; then
+            elif [[ "$original_domain" =~ [[:space:]] ]] || ! [[ "$original_domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$ ]] || ! [[ "$original_domain" == *.* ]]; then
                 log_error "Неверный формат домена: $original_domain"
                 original_domain=""
             fi
@@ -2395,7 +2395,7 @@ EOF
 
     # Добавление Cloudflare токена если используется wildcard
     if [ "$USE_WILDCARD" = true ]; then
-        echo "CLOUDFLARE_API_TOKEN=$CLOUDFLARE_API_TOKEN" >> "$CADDY_DIR/.env"
+        printf 'CLOUDFLARE_API_TOKEN=%s\n' "$CLOUDFLARE_API_TOKEN" >> "$CADDY_DIR/.env"
         echo "# Wildcard certificate enabled for: $domain" >> "$CADDY_DIR/.env"
         echo "# Original domain for Xray serverNames: $original_domain" >> "$CADDY_DIR/.env"
     fi
@@ -2462,7 +2462,7 @@ EOF
 			roll_keep 5
 			roll_keep_for 720h
 		}
-		level ERROR
+		level INFO
 		format json
 	}
 }
@@ -2492,7 +2492,7 @@ https://{\$SELF_STEAL_DOMAIN} {
 			roll_keep 5
 			roll_keep_for 720h
 		}
-		level ERROR
+		level INFO
 		format json
 	}
 }
@@ -2510,7 +2510,7 @@ EOF
 			roll_keep 5
 			roll_keep_for 720h
 		}
-		level ERROR
+		level INFO
 		format json
 	}
 }
@@ -2542,7 +2542,7 @@ https://{\$SELF_STEAL_DOMAIN} {
 			roll_keep 5
 			roll_keep_for 720h
 		}
-		level ERROR
+		level INFO
 		format json
 	}
 }
@@ -3585,8 +3585,14 @@ _update_remnanode() {
         return 0
     fi
     log_info "Обновление RemnawaveNode..."
-    docker compose --project-directory "$REMNANODE_DIR" pull
-    docker compose --project-directory "$REMNANODE_DIR" up -d
+    if ! docker compose --project-directory "$REMNANODE_DIR" pull; then
+        log_error "Не удалось скачать образ RemnawaveNode"
+        return 1
+    fi
+    if ! docker compose --project-directory "$REMNANODE_DIR" up -d; then
+        log_error "Не удалось запустить RemnawaveNode"
+        return 1
+    fi
     log_success "RemnawaveNode обновлён"
 }
 
@@ -3613,8 +3619,14 @@ _update_caddy() {
         return 0
     fi
     log_info "Обновление Caddy..."
-    docker compose --project-directory "$CADDY_DIR" pull
-    docker compose --project-directory "$CADDY_DIR" up -d
+    if ! docker compose --project-directory "$CADDY_DIR" pull; then
+        log_error "Не удалось скачать образ Caddy"
+        return 1
+    fi
+    if ! docker compose --project-directory "$CADDY_DIR" up -d; then
+        log_error "Не удалось запустить Caddy"
+        return 1
+    fi
     log_success "Caddy обновлён"
 }
 
@@ -3647,8 +3659,8 @@ _update_monitoring() {
     local ne_dir="/opt/monitoring/nodeexporter"
     local ne_url="https://github.com/prometheus/node_exporter/releases/download/v${NODE_EXPORTER_VERSION}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}.tar.gz"
     if download_with_progress "$ne_url" "${ne_dir}/node_exporter.tar.gz" "Скачивание Node Exporter..."; then
-        tar -xzf "${ne_dir}/node_exporter.tar.gz" -C "${ne_dir}"
-        mv "${ne_dir}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}/node_exporter" "${ne_dir}/" 2>/dev/null || true
+        tar --no-same-owner -xzf "${ne_dir}/node_exporter.tar.gz" -C "${ne_dir}" || { log_error "Не удалось распаковать Node Exporter"; return 1; }
+        mv "${ne_dir}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}/node_exporter" "${ne_dir}/" || { log_error "Файл node_exporter не найден в архиве"; return 1; }
         chmod +x "${ne_dir}/node_exporter"
         rm -rf "${ne_dir}/node_exporter-${NODE_EXPORTER_VERSION}.linux-${ARCH}" "${ne_dir}/node_exporter.tar.gz"
         log_success "Node Exporter обновлён"
@@ -4167,13 +4179,13 @@ uninstall_all() {
     # Удаление logrotate конфига
     rm -f /etc/logrotate.d/remnanode
 
-    # Удаление директорий
+    # Удаление директорий (с проверкой на пустые переменные)
     log_info "Удаление файлов..."
-    rm -rf "$REMNANODE_DIR"
-    rm -rf "$REMNANODE_DATA_DIR"
-    rm -rf "$CADDY_DIR"
-    rm -rf /opt/monitoring
-    rm -rf /var/log/remnanode
+    [ -n "$REMNANODE_DIR" ] && [ -d "$REMNANODE_DIR" ] && rm -rf "$REMNANODE_DIR"
+    [ -n "$REMNANODE_DATA_DIR" ] && [ -d "$REMNANODE_DATA_DIR" ] && rm -rf "$REMNANODE_DATA_DIR"
+    [ -n "$CADDY_DIR" ] && [ -d "$CADDY_DIR" ] && rm -rf "$CADDY_DIR"
+    [ -d /opt/monitoring ] && rm -rf /opt/monitoring
+    [ -d /var/log/remnanode ] && rm -rf /var/log/remnanode
 
     echo
 
