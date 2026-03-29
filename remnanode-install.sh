@@ -185,7 +185,7 @@ download_with_progress() {
     local output="$2"
     local msg="${3:-Скачивание...}"
 
-    wget --timeout=30 --tries=3 "$url" -q -O "$output" &
+    wget --timeout=60 --tries=5 --waitretry=2 "$url" -q -O "$output" &
     local pid=$!
     spinner "$pid" "$msg"
     return $?
@@ -2894,7 +2894,8 @@ install_grafana_monitoring() {
     local vmagent_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v${VMAGENT_VERSION}/vmutils-linux-${ARCH}-v${VMAGENT_VERSION}.tar.gz"
 
     if ! download_with_progress "$vmagent_url" "${vm_dir}/vmagent.tar.gz" "Скачивание VictoriaMetrics Agent v${VMAGENT_VERSION}..."; then
-        log_error "Не удалось скачать VictoriaMetrics Agent"
+        log_error "Не удалось скачать VictoriaMetrics Agent с $vmagent_url"
+        log_info "Проверьте: 1) Интернет соединение, 2) Доступность GitHub, 3) Версия пакета"
         return 1
     fi
 
@@ -3679,7 +3680,8 @@ _update_monitoring() {
         chmod +x "${vm_dir}/vmagent"
         log_success "VM Agent обновлён"
     else
-        log_error "Не удалось обновить VM Agent"
+        log_error "Не удалось обновить VM Agent с $vm_url"
+        log_info "Проверьте: 1) Интернет соединение, 2) Доступность GitHub, 3) Версия пакета"
     fi
 
     # Запуск служб
