@@ -340,6 +340,47 @@ fetch_latest_version() {
     fi
 }
 
+# Получение последней версии VictoriaMetrics с open-source vmutils
+# /releases/latest может указывать на enterprise-only LTS ветку (v1.122.x),
+# поэтому ищем первый релиз с open-source vmutils-linux ассетом
+fetch_latest_vmagent_version() {
+    local default="$1"
+    local version=""
+    local api_response
+
+    api_response=$(curl -s --connect-timeout 5 --max-time 15 \
+        "https://api.github.com/repos/VictoriaMetrics/VictoriaMetrics/releases?per_page=15" 2>/dev/null) || true
+
+    if [ -n "$api_response" ]; then
+        if command -v jq >/dev/null 2>&1; then
+            # Найти первый релиз, содержащий open-source vmutils-linux ассет
+            version=$(echo "$api_response" | jq -r '
+                [.[] | select(.assets[]?.name | test("^vmutils-linux-.*\\.tar\\.gz$") and (test("enterprise") | not))][0].tag_name // empty
+            ' 2>/dev/null | sed 's/^v//')
+        else
+            # Без jq — проверяем URL каждого релиза до первого успешного
+            local tags
+            tags=$(echo "$api_response" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+            for tag in $tags; do
+                local ver="${tag#v}"
+                local check_url="https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/${tag}/vmutils-linux-amd64-${tag}.tar.gz"
+                local http_code
+                http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 --max-time 5 -I -L "$check_url" 2>/dev/null) || true
+                if [ "$http_code" = "200" ]; then
+                    version="$ver"
+                    break
+                fi
+            done
+        fi
+    fi
+
+    if [ -n "$version" ]; then
+        echo "$version"
+    else
+        echo "$default"
+    fi
+}
+
 # Проверка здоровья Docker контейнера с ожиданием
 check_container_health() {
     local compose_dir="$1"
@@ -834,7 +875,7 @@ update_component_versions() {
         NODE_EXPORTER_VERSION="$new_ver"
     fi
 
-    new_ver=$(fetch_latest_version "VictoriaMetrics/VictoriaMetrics" "$VMAGENT_VERSION")
+    new_ver=$(fetch_latest_vmagent_version "$VMAGENT_VERSION")
     if [ -n "$new_ver" ]; then
         [ "$new_ver" != "$VMAGENT_VERSION" ] && log_info "VM Agent: v$new_ver (обновлено)"
         VMAGENT_VERSION="$new_ver"
